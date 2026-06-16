@@ -33,7 +33,8 @@ class HA_GCT(nn.Module):
         nhead=8,
         num_classes=400,         # 400VSL dataset
         dropout=0.1,
-        graph_lambda=0.1         # lambda in MHSA formula
+        graph_lambda=0.1,        # lambda in MHSA formula
+        max_frames=100
     ):
         super().__init__()
         
@@ -42,7 +43,7 @@ class HA_GCT(nn.Module):
             in_channels=in_channels,
             num_joints=num_joints,
             d_model=d_model,
-            max_frames=100,
+            max_frames=max_frames,
             dropout=dropout
         )
         

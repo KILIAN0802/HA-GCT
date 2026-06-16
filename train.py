@@ -147,6 +147,9 @@ def main():
     run_save_dir = os.path.join(args.save_dir, run_id)
     run_log_dir = os.path.join(args.log_dir, run_id)
     
+    # Determine max frames based on dataset
+    max_frames = 150 if args.dataset == 'multivsl200' else 64
+    
     # Auto-adjust classes for MultiVSL200 if not customized
     if args.dataset == 'multivsl200' and args.num_classes == 400:
         args.num_classes = 199
@@ -165,7 +168,6 @@ def main():
     # Load loaders
     if not args.dummy_test:
         from utils.preprocessing import SkeletonTransforms
-        max_frames = 150 if args.dataset == 'multivsl200' else 64
         
         transform = SkeletonTransforms(
             num_joints=args.num_point,
@@ -198,7 +200,8 @@ def main():
         nhead=8,
         num_classes=args.num_classes,
         dropout=0.1,
-        graph_lambda=0.1
+        graph_lambda=0.1,
+        max_frames=max_frames
     ).to(device)
     
     criterion = nn.CrossEntropyLoss()
