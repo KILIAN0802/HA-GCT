@@ -141,6 +141,12 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
+    # Generate unique run ID based on timestamp
+    import datetime
+    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_save_dir = os.path.join(args.save_dir, run_id)
+    run_log_dir = os.path.join(args.log_dir, run_id)
+    
     # Auto-adjust classes for MultiVSL200 if not customized
     if args.dataset == 'multivsl200' and args.num_classes == 400:
         args.num_classes = 199
@@ -152,9 +158,9 @@ def main():
         wandb.init(
             project=args.wandb_project,
             config=vars(args),
-            name=f"ha_gct_{args.dataset}_epochs_{args.epochs}_lr_{args.lr}"
+            name=f"ha_gct_{args.dataset}_{run_id}"
         )
-        print("Initialized Weights & Biases (wandb) logger.")
+        print(f"Initialized Weights & Biases (wandb) logger for run: {run_id}")
     
     # Load loaders
     if not args.dummy_test:
@@ -199,8 +205,9 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
-    os.makedirs(args.save_dir, exist_ok=True)
-    writer = SummaryWriter(args.log_dir)
+    os.makedirs(run_save_dir, exist_ok=True)
+    os.makedirs(run_log_dir, exist_ok=True)
+    writer = SummaryWriter(run_log_dir)
     
     best_acc = -1.0
     print("\nStarting training loops...")
@@ -232,7 +239,7 @@ def main():
         # Save best model
         if val_acc > best_acc:
             best_acc = val_acc
-            best_path = os.path.join(args.save_dir, 'best_ha_gct_model.pth')
+            best_path = os.path.join(run_save_dir, 'best_ha_gct_model.pth')
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -245,13 +252,13 @@ def main():
             
         # Periodic save
         if (epoch + 1) % 10 == 0:
-            periodic_path = os.path.join(args.save_dir, f'ha_gct_epoch_{epoch+1}.pth')
+            periodic_path = os.path.join(run_save_dir, f'ha_gct_epoch_{epoch+1}.pth')
             torch.save(model.state_dict(), periodic_path)
             if use_wandb:
                 wandb.save(periodic_path)
             
     print("\nTraining completed. Evaluating on test set...")
-    best_checkpoint = torch.load(os.path.join(args.save_dir, 'best_ha_gct_model.pth'), map_location=device)
+    best_checkpoint = torch.load(os.path.join(run_save_dir, 'best_ha_gct_model.pth'), map_location=device)
     model.load_state_dict(best_checkpoint['model_state_dict'])
     
     test_loss, test_acc = eval_model(model, test_loader, criterion, device, desc="[Test]")
