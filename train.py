@@ -131,9 +131,15 @@ def main():
     
     # Load loaders
     if check_dataset_exists(args.data_dir) and not args.dummy_test:
-        print(f"Loading dataloaders from {args.data_dir}...")
+        print(f"Loading dataloaders from {args.data_dir} with SkeletonTransforms...")
+        from utils.preprocessing import SkeletonTransforms
+        transform = SkeletonTransforms(
+            num_joints=args.num_point,
+            max_frames=64,
+            verbose=False
+        )
         train_loader, val_loader, test_loader = get_dataloaders(
-            args.data_dir, batch_size=args.batch_size, num_workers=4
+            args.data_dir, batch_size=args.batch_size, num_workers=4, transform=transform
         )
     else:
         train_loader, val_loader, test_loader = get_dummy_loaders(args)

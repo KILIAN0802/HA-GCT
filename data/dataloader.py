@@ -3,6 +3,7 @@ import pickle
 import torch
 from torch.utils.data import Dataset, DataLoader
 from utils.augmentation import SpatialAugmentation
+from utils.preprocessing import SkeletonTransforms
 
 class VSLDataset(Dataset):
     """Dataset cho 400VSL với Augmentation"""
@@ -48,14 +49,17 @@ class VSLDataset(Dataset):
         if self.transform:
             sample = self.transform(sample)
         
-        return torch.FloatTensor(sample), torch.LongTensor([label]).squeeze() #squeeze dùng để bỏ chiều dư thừa
+        if isinstance(sample, torch.Tensor):
+            return sample.float(), torch.LongTensor([label]).squeeze()
+        else:
+            return torch.FloatTensor(sample), torch.LongTensor([label]).squeeze() #squeeze dùng để bỏ chiều dư thừa
 
 
-def get_dataloaders(data_dir, batch_size=32, num_workers=4):
+def get_dataloaders(data_dir, batch_size=32, num_workers=4, transform=None):
     #Create train, val, test dataset  
-    train_dataset = VSLDataset(f'{data_dir}/train_data_joint.npy', f'{data_dir}/train_label.pkl')
-    val_dataset = VSLDataset(f'{data_dir}/val_data_joint.npy', f'{data_dir}/val_label.pkl')
-    test_dataset = VSLDataset(f'{data_dir}/test_data_joint.npy', f'{data_dir}/test_label.pkl')
+    train_dataset = VSLDataset(f'{data_dir}/train_data_joint.npy', f'{data_dir}/train_label.pkl', transform=transform, is_train=True)
+    val_dataset = VSLDataset(f'{data_dir}/val_data_joint.npy', f'{data_dir}/val_label.pkl', transform=transform, is_train=False)
+    test_dataset = VSLDataset(f'{data_dir}/test_data_joint.npy', f'{data_dir}/test_label.pkl', transform=transform, is_train=False)
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
