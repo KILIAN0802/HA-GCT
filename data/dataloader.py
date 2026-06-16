@@ -1,40 +1,52 @@
 import numpy as np
 import pickle
-
 import torch
 from torch.utils.data import Dataset, DataLoader
+from utils.augmentation import SpatialAugmentation
 
 class VSLDataset(Dataset):
-
-    def __init__(self, data_path, label_path):
-        #Load data
+    """Dataset cho 400VSL với Augmentation"""
+    def __init__(self, data_path, label_path, transform=None, is_train=True):
         self.data = np.load(data_path)
-
-        #Load label
         with open(label_path, 'rb') as f:
             self.labels = pickle.load(f)
-
-        # Print shape info
-        print(f"Loaded {len(self.data)} video samples")
-        print(f"Video shape: {self.data.shape[1:]}")
-        print(f"Number of action classes: {len(np.unique(self.labels))}")
-
-        #Handle different data formats
+        self.transform = transform
+        self.is_train = is_train
+        
+        # Handle different formats
         if self.data.ndim == 4:
-            #Format: (N, C, T, V) -> (N, T, V, C)
-            if self.data.shape[1] in [2, 3]: #(N, C, T, V)
+            if self.data.shape[1] in [2, 3]:
                 pass
-            elif self.data.shape[3] in [2, 3]: #(N, T, V, C)
+            elif self.data.shape[2] in [2, 3]:
                 self.data = self.data.transpose(0, 3, 1, 2)
-            else:
-                raise ValueError(f"Unknown data format: {self.data.shape}")
-
+        
+        # Initialize Augmentation (chỉ áp dụng khi train)
+        if is_train:
+            self.augmentor = SpatialAugmentation(
+                num_joints=27,
+                mask_prob=0.1,        # 10% chance to mask joints
+                num_mask_joints=2,    # Mask 2 joints
+                bone_scale=0.05       # ±5% bone length
+            )
+        else:
+            self.augmentor = None
+        
+        print(f"Loaded {len(self.data)} samples ({'Train' if is_train else 'Test'})")
+    
     def __len__(self):
         return len(self.data)
-
+    
     def __getitem__(self, idx):
-        sample = self.data[idx]
+        sample = self.data[idx]  # (C, T, V)
         label = self.labels[idx]
+        
+        # Apply Spatial Augmentation (chỉ khi train)
+        if self.is_train and self.augmentor is not None:
+            sample = self.augmentor(sample)
+        
+        # Apply other transforms (One Euro Filter, Normalization...)
+        if self.transform:
+            sample = self.transform(sample)
         
         return torch.FloatTensor(sample), torch.LongTensor([label]).squeeze() #squeeze dùng để bỏ chiều dư thừa
 
