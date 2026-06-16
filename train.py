@@ -40,6 +40,7 @@ def parse_args():
     parser.add_argument('--wandb-project', type=str, default='HA-GCT', help='Weights & Biases project name')
     parser.add_argument('--dataset', type=str, default='vsl400', choices=['vsl400', 'multivsl200'], help='Dataset selection')
     parser.add_argument('--split-method', type=str, default='random', choices=['random', 'signer'], help='MultiVSL200 dataset split method')
+    parser.add_argument('--resume', type=str, default='', help='Path to checkpoint to resume training from')
     return parser.parse_args()
 
 def check_dataset_exists(data_dir):
@@ -141,9 +142,20 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Generate unique run ID based on timestamp
+    # Generate unique run ID based on timestamp or extract from checkpoint if resuming
     import datetime
     run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    is_resume = False
+    
+    if args.resume and os.path.isfile(args.resume):
+        is_resume = True
+        # Try to extract run_id from parent directory of the checkpoint file
+        parent_dir = os.path.basename(os.path.dirname(args.resume))
+        # E.g. checkpoints/20260616_221935/best_ha_gct_model.pth -> parent_dir is '20260616_221935'
+        if parent_dir and parent_dir != 'checkpoints':
+            run_id = parent_dir
+            print(f"Resuming run with ID: {run_id}")
+            
     run_save_dir = os.path.join(args.save_dir, run_id)
     run_log_dir = os.path.join(args.log_dir, run_id)
     
@@ -161,7 +173,9 @@ def main():
         wandb.init(
             project=args.wandb_project,
             config=vars(args),
-            name=f"ha_gct_{args.dataset}_{run_id}"
+            name=f"ha_gct_{args.dataset}_{run_id}",
+            id=run_id,
+            resume="allow"
         )
         print(f"Initialized Weights & Biases (wandb) logger for run: {run_id}")
     
@@ -208,13 +222,48 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
+    start_epoch = 0
+    best_acc = -1.0
+    
+    if is_resume:
+        print(f"Loading checkpoint from: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print("Restored optimizer state.")
+            if 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                print("Restored learning rate scheduler state.")
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1
+                print(f"Resuming training from epoch {start_epoch + 1}")
+            if 'best_acc' in checkpoint:
+                best_acc = checkpoint['best_acc']
+                print(f"Restored best validation accuracy: {best_acc * 100:.2f}%")
+        else:
+            model.load_state_dict(checkpoint)
+            # Try parsing epoch from filename e.g. ha_gct_epoch_10.pth
+            filename = os.path.basename(args.resume)
+            if 'epoch_' in filename:
+                try:
+                    parts = filename.split('_')
+                    epoch_part = [p for p in parts if p.isdigit() or (p.replace('.pth', '').isdigit())][0]
+                    start_epoch = int(epoch_part.replace('.pth', ''))
+                    print(f"Parsed epoch from filename. Resuming training from epoch {start_epoch + 1}")
+                except Exception:
+                    pass
+            # Fast-forward scheduler if no state dict is loaded
+            for _ in range(start_epoch):
+                scheduler.step()
+                
     os.makedirs(run_save_dir, exist_ok=True)
     os.makedirs(run_log_dir, exist_ok=True)
     writer = SummaryWriter(run_log_dir)
     
-    best_acc = -1.0
     print("\nStarting training loops...")
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, epoch)
         val_loss, val_acc = eval_model(model, val_loader, criterion, device, desc=f"Epoch {epoch+1} [Val]")
         
@@ -247,16 +296,24 @@ def main():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'best_acc': best_acc,
             }, best_path)
             print(f"New best model saved with Val Acc: {best_acc*100:.2f}%")
             if use_wandb:
                 wandb.save(best_path)
             
-        # Periodic save
+        # Periodic save (save full training state for resume capability)
         if (epoch + 1) % 10 == 0:
             periodic_path = os.path.join(run_save_dir, f'ha_gct_epoch_{epoch+1}.pth')
-            torch.save(model.state_dict(), periodic_path)
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_acc': best_acc,
+            }, periodic_path)
+            print(f"Periodic checkpoint saved: {periodic_path}")
             if use_wandb:
                 wandb.save(periodic_path)
             
