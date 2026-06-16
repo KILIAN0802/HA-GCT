@@ -175,18 +175,25 @@ class SkeletonTransforms:
         if coords.ndim == 3 and coords.shape[0] in [2, 3]:
             coords = coords.transpose(1, 2, 0)  # Shape: (T, V, C)
             
+        # Check if the third channel is actually Z-coordinate (i.e. contains negative values or values > 1.0)
+        # instead of a confidence score in [0, 1].
+        is_z = False
+        if coords.ndim == 3 and coords.shape[-1] == 3 and confidence is None:
+            c3 = coords[:, :, 2]
+            if (c3 < 0.0).any() or (c3 > 1.0).any():
+                is_z = True
+            
         # Extract or construct (T, N, 3) for preprocessor
         if confidence is not None:
             T, N, _ = coords.shape
             confidence_expanded = np.expand_dims(confidence, axis=-1)
             skeleton_data = np.concatenate([coords[:, :, :2], confidence_expanded], axis=-1)
+        elif is_z or coords.shape[-1] == 2:
+            T, N, _ = coords.shape
+            confidence_expanded = np.ones((T, N, 1), dtype=coords.dtype)
+            skeleton_data = np.concatenate([coords[:, :, :2], confidence_expanded], axis=-1)
         else:
-            if coords.shape[-1] == 2:
-                T, N, _ = coords.shape
-                confidence_expanded = np.ones((T, N, 1), dtype=coords.dtype)
-                skeleton_data = np.concatenate([coords, confidence_expanded], axis=-1)
-            else:
-                skeleton_data = coords.copy()
+            skeleton_data = coords.copy()
                 
         # Run preprocessing (Interpolation, One Euro Filter, Normalization)
         preprocessed = self.preprocessor.preprocess(skeleton_data, apply_filter=True)

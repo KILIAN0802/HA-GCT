@@ -9,6 +9,12 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 sys.path.extend(['./', '../'])
 
 from data.dataloader import get_dataloaders
@@ -28,6 +34,12 @@ def parse_args():
     parser.add_argument('--dummy-test', action='store_true', help='Force training with dummy data for verification')
     parser.add_argument('--save-dir', type=str, default='checkpoints', help='Directory to save model checkpoints')
     parser.add_argument('--log-dir', type=str, default='results/logs', help='Directory for TensorBoard logs')
+    
+    # wandb & dataset options
+    parser.add_argument('--use-wandb', action='store_true', default=True, help='Use Weights & Biases for logging')
+    parser.add_argument('--wandb-project', type=str, default='HA-GCT', help='Weights & Biases project name')
+    parser.add_argument('--dataset', type=str, default='vsl400', choices=['vsl400', 'multivsl200'], help='Dataset selection')
+    parser.add_argument('--split-method', type=str, default='random', choices=['random', 'signer'], help='MultiVSL200 dataset split method')
     return parser.parse_args()
 
 def check_dataset_exists(data_dir):
@@ -129,18 +141,43 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
+    # Auto-adjust classes for MultiVSL200 if not customized
+    if args.dataset == 'multivsl200' and args.num_classes == 400:
+        args.num_classes = 199
+        print(f"Auto-configured num_classes to 199 for MultiVSL200 dataset.")
+        
+    # Initialize wandb if requested and available
+    use_wandb = args.use_wandb and WANDB_AVAILABLE
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            config=vars(args),
+            name=f"ha_gct_{args.dataset}_epochs_{args.epochs}_lr_{args.lr}"
+        )
+        print("Initialized Weights & Biases (wandb) logger.")
+    
     # Load loaders
-    if check_dataset_exists(args.data_dir) and not args.dummy_test:
-        print(f"Loading dataloaders from {args.data_dir} with SkeletonTransforms...")
+    if not args.dummy_test:
         from utils.preprocessing import SkeletonTransforms
+        max_frames = 150 if args.dataset == 'multivsl200' else 64
+        
         transform = SkeletonTransforms(
             num_joints=args.num_point,
-            max_frames=64,
+            max_frames=max_frames,
             verbose=False
         )
-        train_loader, val_loader, test_loader = get_dataloaders(
-            args.data_dir, batch_size=args.batch_size, num_workers=4, transform=transform
-        )
+        
+        if args.dataset == 'multivsl200':
+            print(f"Loading MultiVSL200 dataloaders from {args.data_dir} with SkeletonTransforms...")
+            from data.dataloader import get_multivsl_loaders
+            train_loader, val_loader, test_loader = get_multivsl_loaders(
+                args.data_dir, batch_size=args.batch_size, num_workers=4, transform=transform, split_method=args.split_method
+            )
+        else:
+            print(f"Loading 400VSL dataloaders from {args.data_dir} with SkeletonTransforms...")
+            train_loader, val_loader, test_loader = get_dataloaders(
+                args.data_dir, batch_size=args.batch_size, num_workers=4, transform=transform
+            )
     else:
         train_loader, val_loader, test_loader = get_dummy_loaders(args)
         
@@ -179,6 +216,17 @@ def main():
         writer.add_scalar('Accuracy/train', train_acc, epoch)
         writer.add_scalar('Accuracy/val', val_acc, epoch)
         
+        # Log to wandb
+        if use_wandb:
+            wandb.log({
+                "epoch": epoch + 1,
+                "train_loss": train_loss,
+                "train_acc": train_acc,
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "lr": scheduler.get_last_lr()[0]
+            })
+            
         print(f"Epoch {epoch+1} Summary - Train Loss: {train_loss:.4f}, Train Acc: {train_acc*100:.2f}%, Val Loss: {val_loss:.4f}, Val Acc: {val_acc*100:.2f}%")
         
         # Save best model
@@ -192,11 +240,15 @@ def main():
                 'best_acc': best_acc,
             }, best_path)
             print(f"New best model saved with Val Acc: {best_acc*100:.2f}%")
+            if use_wandb:
+                wandb.save(best_path)
             
         # Periodic save
         if (epoch + 1) % 10 == 0:
             periodic_path = os.path.join(args.save_dir, f'ha_gct_epoch_{epoch+1}.pth')
             torch.save(model.state_dict(), periodic_path)
+            if use_wandb:
+                wandb.save(periodic_path)
             
     print("\nTraining completed. Evaluating on test set...")
     best_checkpoint = torch.load(os.path.join(args.save_dir, 'best_ha_gct_model.pth'), map_location=device)
@@ -205,6 +257,13 @@ def main():
     test_loss, test_acc = eval_model(model, test_loader, criterion, device, desc="[Test]")
     print(f"Final Test Result - Loss: {test_loss:.4f}, Acc: {test_acc*100:.2f}%")
     
+    if use_wandb:
+        wandb.log({
+            "test_loss": test_loss,
+            "test_acc": test_acc
+        })
+        wandb.finish()
+        
     writer.close()
 
 if __name__ == '__main__':
