@@ -17,8 +17,8 @@ class PhysicalEmbedding(nn.Module):
     def __init__(self, in_channels, num_joints, d_model, max_frames=100, dropout=0.1):
         super().__init__()
         
-        # Linear projection for coordinate features
-        self.projection = nn.Linear(in_channels, d_model)
+        # Conv2d projection for coordinate features
+        self.projection = nn.Conv2d(in_channels, d_model, kernel_size=1)
         
         # Learnable spatial positional embeddings for each joint
         self.joint_embed = nn.Parameter(torch.randn(1, 1, num_joints, d_model) * 0.02)
@@ -37,8 +37,14 @@ class PhysicalEmbedding(nn.Module):
         """
         B, T, N, C = x.shape
         
-        # Project coordinate channels: (B, T, N, C) -> (B, T, N, D)
+        # Permute to (B, C, T, N) for Conv2d
+        x = x.permute(0, 3, 1, 2).contiguous()
+        
+        # Project coordinate channels: (B, C, T, N) -> (B, D, T, N)
         x = self.projection(x)
+        
+        # Permute back to (B, T, N, D)
+        x = x.permute(0, 2, 3, 1).contiguous()
         
         # Add joint and frame embeddings
         # joint_embed is broadcasted across Batch and Time dimensions

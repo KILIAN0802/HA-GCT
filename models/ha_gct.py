@@ -9,7 +9,7 @@ from models.ha_gc_block import HA_GC_Block
 from models.mhsa import MHSAEncoderLayer
 from models.adaptive_graph import AdaptiveGraphRefinement
 from models.cross_attention import CrossAttentionFusion
-from models.classification_head import ClassificationHead
+from models.classification_head import SimpleClassificationHead
 
 class HA_GCT(nn.Module):
     """
@@ -80,11 +80,9 @@ class HA_GCT(nn.Module):
         )
         
         # 6. CLASSIFICATION HEAD (GAP + Softmax)
-        self.classifier = ClassificationHead(
+        self.classifier = SimpleClassificationHead(
             d_model=d_model,
-            num_classes=num_classes,
-            hidden_dim=d_model,
-            dropout=0.5
+            num_classes=num_classes
         )
     
     def forward(self, x):

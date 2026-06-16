@@ -23,12 +23,13 @@ class AdaptiveGraphRefinement(nn.Module):
         self.fc_q = nn.Linear(d_model, d_model)
         self.fc_k = nn.Linear(d_model, d_model)
         
-        # Base learnable dynamic parameter matrix of size 100 x 100
-        self.A_dyn = nn.Parameter(torch.randn(100, 100) * 0.02)
+        # Base learnable parameter matrix of size 100 x 100
+        self.A_lrn = nn.Parameter(torch.randn(100, 100) * 0.02)
         
-        # Coefficients for balancing learned and data-dependent graph
+        # Coefficients for balancing fixed, learned and data-dependent graphs
         self.alpha = nn.Parameter(torch.tensor(0.5))
         self.beta = nn.Parameter(torch.tensor(0.5))
+        self.gamma = nn.Parameter(torch.tensor(0.5))
         
         self._init_weights()
         
@@ -38,10 +39,11 @@ class AdaptiveGraphRefinement(nn.Module):
         nn.init.xavier_uniform_(self.fc_k.weight)
         nn.init.zeros_(self.fc_k.bias)
 
-    def forward(self, x):
+    def forward(self, x, A_fix=None):
         """
         Args:
             x: Temporal features of shape (B, T, D)
+            A_fix: Fixed adjacency matrix (optional)
         Returns:
             A_final: Refined adjacency matrix of shape (B, T, T)
         """
@@ -51,21 +53,47 @@ class AdaptiveGraphRefinement(nn.Module):
         Q = self.fc_q(x)
         K = self.fc_k(x)
         A_dep = torch.bmm(Q, K.transpose(1, 2)) / math.sqrt(D)
-        A_dep = F.softmax(A_dep, dim=-1)
         
-        # Bilinearly interpolate the dynamic parameter matrix if T is different from 100
+        # Handle A_fix
+        if A_fix is None:
+            # Construct a tridiagonal adjacency matrix of shape (T, T) for consecutive frames
+            device = x.device
+            A_fix_tensor = torch.eye(T, device=device)
+            if T > 1:
+                diag_ones = torch.ones(T - 1, device=device)
+                A_fix_tensor = A_fix_tensor + torch.diag(diag_ones, diagonal=1) + torch.diag(diag_ones, diagonal=-1)
+            A_fix_tensor = A_fix_tensor.unsqueeze(0)  # Shape: (1, T, T)
+        else:
+            if A_fix.dim() == 2:
+                A_fix_tensor = A_fix.unsqueeze(0)
+            else:
+                A_fix_tensor = A_fix
+            
+            # Interpolate if shape doesn't match T
+            if A_fix_tensor.shape[-1] != T:
+                A_fix_tensor = F.interpolate(
+                    A_fix_tensor.unsqueeze(1) if A_fix_tensor.dim() == 3 else A_fix_tensor,
+                    size=(T, T),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                if A_fix_tensor.dim() == 4:
+                    A_fix_tensor = A_fix_tensor.squeeze(1)
+        
+        # Bilinearly interpolate the learnable parameter matrix if T is different from 100
         if T != 100:
-            A_dyn = F.interpolate(
-                self.A_dyn.unsqueeze(0).unsqueeze(0),
+            A_lrn = F.interpolate(
+                self.A_lrn.unsqueeze(0).unsqueeze(0),
                 size=(T, T),
                 mode='bilinear',
                 align_corners=False
-            ).squeeze(0).squeeze(0)
+            ).squeeze(0)  # Shape: (1, T, T)
         else:
-            A_dyn = self.A_dyn
+            A_lrn = self.A_lrn.unsqueeze(0)  # Shape: (1, T, T)
             
-        # Linear combination: A_final = alpha * A_dyn + beta * A_dep
-        A_final = self.alpha * A_dyn.unsqueeze(0) + self.beta * A_dep
+        # Linear combination: A_final = Softmax(alpha * A_fix + beta * A_lrn + gamma * A_dep, dim=-1)
+        weighted_sum = self.alpha * A_fix_tensor + self.beta * A_lrn + self.gamma * A_dep
+        A_final = F.softmax(weighted_sum, dim=-1)
         
         return A_final
 

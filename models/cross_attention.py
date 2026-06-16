@@ -56,24 +56,15 @@ class CrossAttentionFusion(nn.Module):
         self.norm_t2s = nn.LayerNorm(d_model)
         self.dropout_t2s = nn.Dropout(dropout)
         
-        # ========== GATED FUSION MECHANISM ==========
-        # Học cách cân bằng thông tin từ 2 hướng
-        self.gate_net = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
-            nn.Sigmoid()  # Output trong khoảng [0, 1]
-        )
-        
-        # ========== FINAL FUSION LAYER ==========
-        # Combine và refine features sau fusion
-        self.fusion_layer = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
-            nn.LayerNorm(d_model),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
+        # ========== FUSION PROJECTION LAYER ==========
+        self.fusion_proj = nn.Linear(d_model * 2, d_model)
         
         # Residual connection
         self.residual_norm = nn.LayerNorm(d_model)
+        
+        # Initialize weights
+        nn.init.xavier_uniform_(self.fusion_proj.weight)
+        nn.init.zeros_(self.fusion_proj.bias)
     
     def forward(self, spatial_feat, temporal_feat):
         """
@@ -113,7 +104,7 @@ class CrossAttentionFusion(nn.Module):
         
         # Residual connection + LayerNorm
         spatial_attn_out = self.dropout_s2t(spatial_attn_out)
-        spatial_out = self.norm_s2t(spatial_feat + spatial_attn_out)
+        spatial_attn_out = self.norm_s2t(spatial_feat + spatial_attn_out)
         
         # ========== DIRECTION 2: Temporal attends to Spatial ==========
         # Q từ temporal, K và V từ spatial
@@ -128,35 +119,21 @@ class CrossAttentionFusion(nn.Module):
         
         # Residual connection + LayerNorm
         temporal_attn_out = self.dropout_t2s(temporal_attn_out)
-        temporal_out = self.norm_t2s(temporal_feat + temporal_attn_out)
+        temporal_attn_out = self.norm_t2s(temporal_feat + temporal_attn_out)
         
         # ========== ALIGN DIMENSIONS ==========
         # Nếu N != T, cần align về cùng kích thước
         if N != T:
             # Pool temporal để match spatial (N < T thường xảy ra)
             # Dùng linear interpolation hoặc mean pooling
-            temporal_out = self._align_dimensions(temporal_out, target_len=N)
+            temporal_attn_out = self._align_dimensions(temporal_attn_out, target_len=N)
             spatial_attn_out = self._align_dimensions(spatial_attn_out, target_len=N)
         
-        # ========== GATED FUSION ==========
-        # Kết hợp thông tin từ 2 directions với learned gate
-        # Gate quyết định direction nào quan trọng hơn cho từng joint
-        combined = torch.cat([spatial_out, temporal_out], dim=-1)  # (B, N, 2D)
-        gate = self.gate_net(combined)  # (B, N, D) - values in [0, 1]
+        # ========== FUSION ==========
+        # Kết hợp thông tin từ 2 directions bằng concatenation
+        combined = torch.cat([spatial_attn_out, temporal_attn_out], dim=-1)  # (B, N, 2D)
         
-        # Weighted combination
-        # gate gần 1 → ưu tiên spatial_out
-        # gate gần 0 → ưu tiên temporal_out
-        gated_fusion = gate * spatial_out + (1 - gate) * temporal_out
-        
-        # ========== FINAL FUSION LAYER ==========
-        # Combine original features với cross-attention outputs
-        final_input = torch.cat([
-            spatial_feat,           # Original spatial features
-            gated_fusion,           # Gated fusion features
-        ], dim=-1)  # (B, N, 2D)
-        
-        fused_feat = self.fusion_layer(final_input)  # (B, N, D)
+        fused_feat = self.fusion_proj(combined)  # (B, N, D)
         
         # Residual connection
         fused_feat = self.residual_norm(spatial_feat + fused_feat)
@@ -302,8 +279,8 @@ if __name__ == '__main__':
     if hasattr(model_bidirectional, 'attn_weights'):
         attn_weights = model_bidirectional.attn_weights
         print(f"\nAttention weights shapes:")
-        print(f"  Spatial→Temporal: {attn_weights['spatial_to_temporal'].shape}")
-        print(f"  Temporal→Spatial: {attn_weights['temporal_to_spatial'].shape}")
+        print(f"  Spatial -> Temporal: {attn_weights['spatial_to_temporal'].shape}")
+        print(f"  Temporal -> Spatial: {attn_weights['temporal_to_spatial'].shape}")
     
     # ========== Test 2: Simple Cross-Attention ==========
     print("\n" + "=" * 70)
@@ -343,5 +320,5 @@ if __name__ == '__main__':
     print(f"  Output:         {output_edge.shape}")
     
     print("\n" + "=" * 70)
-    print("✅ ALL TESTS PASSED!")
+    print("ALL TESTS PASSED!")
     print("=" * 70)
