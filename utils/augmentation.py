@@ -95,26 +95,25 @@ class SpatialAugmentation:
             for joint in self.parents if self.parents[joint] is not None
         }
         
-        # Apply scaling frame-by-frame
-        for t in range(T):
-            for joint in self.topological_order:
-                parent = self.parents[joint]
-                if parent is None:
-                    continue  # Keep root coordinate unchanged
-                
-                # Get coordinates
-                parent_coord = sample[:, t, parent]
-                joint_coord = sample[:, t, joint]
-                
-                # Bone vector
-                bone_vector = joint_coord[:2] - parent_coord[:2]
-                
-                # Scale bone vector
-                scaled_vector = bone_vector * scales[joint]
-                
-                # Update coordinates
-                sample[:2, t, joint] = parent_coord[:2] + scaled_vector
-                
+        # Apply scaling in topological order, vectorized across T
+        for joint in self.topological_order:
+            parent = self.parents[joint]
+            if parent is None:
+                continue  # Keep root coordinate unchanged
+            
+            # Get coordinates for all frames T
+            parent_coords = sample[:2, :, parent]
+            joint_coords = sample[:2, :, joint]
+            
+            # Bone vector
+            bone_vectors = joint_coords - parent_coords
+            
+            # Scale bone vector
+            scaled_vectors = bone_vectors * scales[joint]
+            
+            # Update coordinates
+            sample[:2, :, joint] = parent_coords + scaled_vectors
+            
         return sample
 
     def _apply_joint_masking(self, sample):

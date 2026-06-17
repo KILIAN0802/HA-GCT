@@ -112,7 +112,7 @@ class ClassificationHead(nn.Module):
         nn.init.xavier_uniform_(self.fc2.weight)
         nn.init.zeros_(self.fc2.bias)
     
-    def forward(self, x, return_logits=False):
+    def forward(self, x):
         """
         Forward pass
         
@@ -121,12 +121,9 @@ class ClassificationHead(nn.Module):
                - B: batch size
                - N/T: sequence length (joints hoặc frames)
                - D: feature dimension
-            return_logits: Nếu True, trả về logits thay vì probabilities
         
         Returns:
-            output: 
-               - Nếu return_logits=False: (B, num_classes) - probabilities
-               - Nếu return_logits=True: (B, num_classes) - logits
+            logits: (B, num_classes) - raw logits
         """
         B, N, D = x.shape
         
@@ -151,13 +148,7 @@ class ClassificationHead(nn.Module):
         # (B, hidden_dim) -> (B, num_classes)
         logits = self.fc2(x)
         
-        # Step 7: Softmax (nếu cần probabilities)
-        if return_logits:
-            output = logits
-        else:
-            output = F.softmax(logits, dim=-1)
-        
-        return output
+        return logits
 
 
 class SimpleClassificationHead(nn.Module):
@@ -177,14 +168,10 @@ class SimpleClassificationHead(nn.Module):
         self.gap = GlobalAveragePooling(dim=1)
         self.fc = nn.Linear(d_model, num_classes)
     
-    def forward(self, x, return_logits=False):
+    def forward(self, x):
         pooled = self.gap(x)  # (B, D)
         logits = self.fc(pooled)  # (B, num_classes)
-        
-        if return_logits:
-            return logits
-        else:
-            return F.softmax(logits, dim=-1)
+        return logits
 
 
 # ========== TEST MODULES ==========
@@ -220,14 +207,9 @@ if __name__ == '__main__':
     
     print(f"\nModel parameters: {sum(p.numel() for p in classifier.parameters()):,}")
     
-    # Test with probabilities
-    probs = classifier(x, return_logits=False)
-    print(f"\nOutput (probabilities) shape: {probs.shape}")
-    print(f"Sum of probabilities (should be 1.0): {probs[0].sum().item():.4f}")
-    
-    # Test with logits
-    logits = classifier(x, return_logits=True)
-    print(f"Output (logits) shape: {logits.shape}")
+    # Test forward
+    logits = classifier(x)
+    print(f"\nOutput (logits) shape: {logits.shape}")
     print(f"Logits range: [{logits.min().item():.3f}, {logits.max().item():.3f}]")
     
     # ========== Test 2: Simple Classification Head ==========
@@ -242,9 +224,8 @@ if __name__ == '__main__':
     
     print(f"\nModel parameters: {sum(p.numel() for p in simple_classifier.parameters()):,}")
     
-    probs_simple = simple_classifier(x, return_logits=False)
-    print(f"Output shape: {probs_simple.shape}")
-    print(f"Sum of probabilities: {probs_simple[0].sum().item():.4f}")
+    logits_simple = simple_classifier(x)
+    print(f"Output shape: {logits_simple.shape}")
     
     # ========== Test 3: Global Average Pooling ==========
     print("\n" + "=" * 70)
@@ -273,10 +254,9 @@ if __name__ == '__main__':
         hidden_dim=128
     )
     
-    probs_edge = classifier_edge(x_short)
+    logits_edge = classifier_edge(x_short)
     print(f"\nInput shape:  {x_short.shape}")
-    print(f"Output shape: {probs_edge.shape}")
-    print(f"Sum of probabilities: {probs_edge[0].sum().item():.4f}")
+    print(f"Output shape: {logits_edge.shape}")
     
     # Very long sequence
     x_long = torch.randn(2, 200, 512)
@@ -286,10 +266,10 @@ if __name__ == '__main__':
         hidden_dim=512
     )
     
-    probs_long = classifier_long(x_long)
+    logits_long = classifier_long(x_long)
     print(f"\nInput shape:  {x_long.shape}")
-    print(f"Output shape: {probs_long.shape}")
+    print(f"Output shape: {logits_long.shape}")
     
     print("\n" + "=" * 70)
-    print("✅ ALL TESTS PASSED!")
+    print("ALL TESTS PASSED!")
     print("=" * 70)

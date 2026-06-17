@@ -59,14 +59,14 @@ class OneEuroFilter:
     
     def filter(self, x, t=None):
         """
-        Filter a single value
+        Filter a single value or numpy array of values
         
         Args:
             x: Input value (float or numpy array)
             t: Timestamp (optional, default: use sampling frequency)
         
         Returns:
-            x_filtered: Filtered value
+            x_filtered: Filtered value/array
         """
         # Update timestamp
         if t is None:
@@ -82,18 +82,17 @@ class OneEuroFilter:
         if self.x_prev is not None:
             dx = (x - self.x_prev) / dt
         else:
-            dx = 0.0
+            dx = np.zeros_like(x)
         
         # Filter derivative to reduce noise
         if self.dx_prev is not None:
-            dx_filtered = self._alpha(self.dcutoff) * dx + \
-                         (1.0 - self._alpha(self.dcutoff)) * self.dx_prev
+            alpha_d = self._alpha(self.dcutoff)
+            dx_filtered = alpha_d * dx + (1.0 - alpha_d) * self.dx_prev
         else:
             dx_filtered = dx
         
         # Compute adaptive cutoff frequency
-        # f_c = f_c_min + β·|dx/dt|
-        cutoff = self.mincutoff + self.beta * abs(dx_filtered)
+        cutoff = self.mincutoff + self.beta * np.abs(dx_filtered)
         
         # Compute smoothing factor
         alpha = self._alpha(cutoff)
@@ -131,35 +130,14 @@ class OneEuroFilter:
         Returns:
             filtered_sequence: Filtered sequence with same shape as input
         """
-        # Reset filter
         self.reset()
         
-        # Handle different input shapes
-        if sequence.ndim == 2:
-            # Shape: (T, D)
-            T, D = sequence.shape
-            filtered = np.zeros_like(sequence)
-            
-            for t in range(T):
-                if timestamps is not None:
-                    filtered[t] = self.filter(sequence[t], timestamps[t])
-                else:
-                    filtered[t] = self.filter(sequence[t])
+        T = sequence.shape[0]
+        filtered = np.zeros_like(sequence)
         
-        elif sequence.ndim == 3:
-            # Shape: (T, N, D)
-            T, N, D = sequence.shape
-            filtered = np.zeros_like(sequence)
-            
-            for t in range(T):
-                for n in range(N):
-                    if timestamps is not None:
-                        filtered[t, n] = self.filter(sequence[t, n], timestamps[t])
-                    else:
-                        filtered[t, n] = self.filter(sequence[t, n])
-        
-        else:
-            raise ValueError(f"Unsupported input shape: {sequence.shape}")
+        for t in range(T):
+            ts = timestamps[t] if timestamps is not None else None
+            filtered[t] = self.filter(sequence[t], ts)
         
         return filtered
 
@@ -168,7 +146,7 @@ class MultiJointOneEuroFilter:
     """
     One Euro Filter cho nhiều joints
     
-    Mỗi joint có filter riêng để xử lý độc lập
+    Đã được tối ưu hóa vector hóa để xử lý toàn bộ các joints song song.
     """
     
     def __init__(
@@ -188,17 +166,12 @@ class MultiJointOneEuroFilter:
             dcutoff: Cutoff frequency for derivative (Hz)
         """
         self.num_joints = num_joints
-        
-        # Create separate filter for each joint
-        self.filters = [
-            OneEuroFilter(
-                freq=freq,
-                mincutoff=mincutoff,
-                beta=beta,
-                dcutoff=dcutoff
-            )
-            for _ in range(num_joints)
-        ]
+        self.filter_instance = OneEuroFilter(
+            freq=freq,
+            mincutoff=mincutoff,
+            beta=beta,
+            dcutoff=dcutoff
+        )
     
     def filter(self, joints_data, timestamps=None):
         """
@@ -214,26 +187,11 @@ class MultiJointOneEuroFilter:
         Returns:
             filtered: Shape (T, N, D)
         """
-        T, N, D = joints_data.shape
-        filtered = np.zeros_like(joints_data)
-        
-        # Reset all filters
-        for f in self.filters:
-            f.reset()
-        
-        # Filter each joint independently
-        for n in range(N):
-            joint_sequence = joints_data[:, n, :]  # (T, D)
-            filtered[:, n, :] = self.filters[n].filter_sequence(
-                joint_sequence, timestamps
-            )
-        
-        return filtered
+        return self.filter_instance.filter_sequence(joints_data, timestamps)
     
     def reset(self):
         """Reset all filters"""
-        for f in self.filters:
-            f.reset()
+        self.filter_instance.reset()
 
 
 # ========== TEST MODULES ==========
@@ -333,14 +291,14 @@ if __name__ == '__main__':
     
     for beta in betas:
         filter_test = OneEuroFilter(freq=10, mincutoff=1.0, beta=beta)
-        filtered_test = np.zeros(T)
+        filtered_test = np.zeros_like(noisy_signal)
         
-        for i in range(T):
+        for i in range(len(noisy_signal)):
             filtered_test[i] = filter_test.filter(noisy_signal[i], t[i])
         
         mse = np.mean((filtered_test - clean_signal) ** 2)
         print(f"  beta={beta:.1f}: MSE={mse:.4f}")
     
     print("\n" + "=" * 70)
-    print("✅ ALL TESTS PASSED!")
+    print("ALL TESTS PASSED!")
     print("=" * 70)

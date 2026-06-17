@@ -81,11 +81,13 @@ def get_dummy_loaders(args):
     
     return train_loader, val_loader, test_loader
 
-def train_epoch(model, loader, criterion, optimizer, device, epoch):
+def train_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None):
     model.train()
     total_loss = 0.0
     correct = 0
     total = 0
+    
+    use_amp = (device.type == 'cuda' and scaler is not None)
     
     progress_bar = tqdm(loader, desc=f"Epoch {epoch+1} [Train]")
     for batch_data, batch_labels in progress_bar:
@@ -93,10 +95,20 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch):
         batch_labels = batch_labels.to(device)
         
         optimizer.zero_grad()
-        outputs = model(batch_data)
-        loss = criterion(outputs, batch_labels)
-        loss.backward()
-        optimizer.step()
+        
+        if use_amp:
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                outputs = model(batch_data)
+                loss = criterion(outputs, batch_labels)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            outputs = model(batch_data)
+            loss = criterion(outputs, batch_labels)
+            loss.backward()
+            optimizer.step()
         
         total_loss += loss.item()
         _, predicted = outputs.max(1)
@@ -117,13 +129,20 @@ def eval_model(model, loader, criterion, device, desc="[Val]"):
     correct = 0
     total = 0
     
+    use_amp = (device.type == 'cuda')
+    
     progress_bar = tqdm(loader, desc=desc)
     for batch_data, batch_labels in progress_bar:
         batch_data = batch_data.to(device)
         batch_labels = batch_labels.to(device)
         
-        outputs = model(batch_data)
-        loss = criterion(outputs, batch_labels)
+        if use_amp:
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                outputs = model(batch_data)
+                loss = criterion(outputs, batch_labels)
+        else:
+            outputs = model(batch_data)
+            loss = criterion(outputs, batch_labels)
         
         total_loss += loss.item()
         _, predicted = outputs.max(1)
@@ -220,7 +239,26 @@ def main():
     
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    
+    # Sequential learning rate scheduler with Linear Warm-up & Cosine Annealing
+    warmup_epochs = 10 if args.epochs >= 20 else 5
+    if args.dummy_test:
+        warmup_epochs = 2
+        
+    warmup_scheduler = optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs
+    )
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs - warmup_epochs, eta_min=1e-6
+    )
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs]
+    )
+    
+    # GradScaler for Automatic Mixed Precision (AMP)
+    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
     
     start_epoch = 0
     best_acc = -1.0
@@ -234,8 +272,11 @@ def main():
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 print("Restored optimizer state.")
             if 'scheduler_state_dict' in checkpoint:
-                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                print("Restored learning rate scheduler state.")
+                try:
+                    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    print("Restored learning rate scheduler state.")
+                except Exception as e:
+                    print(f"Warning: Could not restore scheduler state dict: {e}. Re-initializing scheduler.")
             if 'epoch' in checkpoint:
                 start_epoch = checkpoint['epoch'] + 1
                 print(f"Resuming training from epoch {start_epoch + 1}")
@@ -264,7 +305,7 @@ def main():
     
     print("\nStarting training loops...")
     for epoch in range(start_epoch, args.epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, epoch)
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, epoch, scaler)
         val_loss, val_acc = eval_model(model, val_loader, criterion, device, desc=f"Epoch {epoch+1} [Val]")
         
         scheduler.step()

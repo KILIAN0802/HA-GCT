@@ -62,9 +62,17 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, transform=None):
     val_dataset = VSLDataset(f'{data_dir}/val_data_joint.npy', f'{data_dir}/val_label.pkl', transform=transform, is_train=False)
     test_dataset = VSLDataset(f'{data_dir}/test_data_joint.npy', f'{data_dir}/test_label.pkl', transform=transform, is_train=False)
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    dataloader_kwargs = {
+        'batch_size': batch_size,
+        'num_workers': num_workers,
+        'pin_memory': True
+    }
+    if num_workers > 0:
+        dataloader_kwargs['prefetch_factor'] = 2
+        
+    train_loader = DataLoader(train_dataset, shuffle=True, **dataloader_kwargs)
+    val_loader = DataLoader(val_dataset, shuffle=False, **dataloader_kwargs)
+    test_loader = DataLoader(test_dataset, shuffle=False, **dataloader_kwargs)
     
     return train_loader, val_loader, test_loader
 
@@ -145,9 +153,17 @@ def get_multivsl_loaders(data_dir, batch_size=32, num_workers=4, transform=None,
             generator=torch.Generator().manual_seed(42)
         )
         
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    dataloader_kwargs = {
+        'batch_size': batch_size,
+        'num_workers': num_workers,
+        'pin_memory': True
+    }
+    if num_workers > 0:
+        dataloader_kwargs['prefetch_factor'] = 2
+        
+    train_loader = DataLoader(train_dataset, shuffle=True, **dataloader_kwargs)
+    val_loader = DataLoader(val_dataset, shuffle=False, **dataloader_kwargs)
+    test_loader = DataLoader(test_dataset, shuffle=False, **dataloader_kwargs)
     
     return train_loader, val_loader, test_loader
 
