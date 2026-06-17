@@ -27,10 +27,10 @@ class HA_GCT(nn.Module):
         self,
         num_joints=27,
         in_channels=2,
-        d_model=256,
+        d_model=128,
         num_ha_gc_blocks=3,      # x3 as in diagram
         num_mhsa_layers=2,       # x2 as in diagram
-        nhead=8,
+        nhead=4,
         num_classes=400,         # 400VSL dataset
         dropout=0.1,
         graph_lambda=0.1,        # lambda in MHSA formula
@@ -151,7 +151,7 @@ class MultiStreamHA_GCT(nn.Module):
         d_model=128,
         num_ha_gc_blocks=3,
         num_mhsa_layers=2,
-        nhead=8,
+        nhead=4,
         num_classes=400,
         dropout=0.5,
         graph_lambda=0.1,

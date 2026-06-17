@@ -19,7 +19,7 @@ except ImportError:
 sys.path.extend(['./', '../'])
 
 from data.dataloader import get_dataloaders
-from models.ha_gct import MultiStreamHA_GCT
+from models.ha_gct import HA_GCT, MultiStreamHA_GCT
 
 def parse_args():
     parser = argparse.ArgumentParser(description="HA-GCT Training Pipeline")
@@ -43,6 +43,14 @@ def parse_args():
     parser.add_argument('--split-method', type=str, default='random', choices=['random', 'signer'], help='MultiVSL200 dataset split method')
     parser.add_argument('--resume', type=str, default='', help='Path to checkpoint to resume training from')
     parser.add_argument('--tta', action='store_true', help='Use Test-Time Augmentation (TTA) during evaluation')
+    
+    # Phase 3 options
+    parser.add_argument('--pretrain', action='store_true', help='Run self-supervised pre-training (Stage 1)')
+    parser.add_argument('--pretrain-epochs', type=int, default=50, help='Number of pre-training epochs')
+    parser.add_argument('--pretrain-path', type=str, default='checkpoints/pretrained_ha_gct.pth', help='Path to save/load pre-trained encoder weights')
+    parser.add_argument('--class-balanced', action='store_true', help='Use WeightedRandomSampler for class balanced sampling')
+    parser.add_argument('--loss-fn', type=str, default='ce', choices=['ce', 'focal'], help='Loss function selection')
+    
     return parser.parse_args()
 
 def check_dataset_exists(data_dir):
@@ -82,6 +90,154 @@ def get_dummy_loaders(args):
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
     
     return train_loader, val_loader, test_loader
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, label_smoothing=0.1):
+        super().__init__()
+        self.gamma = gamma
+        self.ce = nn.CrossEntropyLoss(reduction='none', label_smoothing=label_smoothing)
+    
+    def forward(self, pred, target):
+        ce_loss = self.ce(pred, target)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
+
+def generate_mask_exact(batch_size, num_frames, num_joints, device):
+    # Vectorized exact masking of 50-75% of joints per frame
+    rand = torch.rand(batch_size, num_frames, num_joints, device=device)
+    ids_shuffle = torch.argsort(rand, dim=-1)
+    
+    p = 0.5 + 0.25 * torch.rand(batch_size, num_frames, 1, device=device)
+    num_mask = (p * num_joints).long()
+    
+    ranks = torch.arange(num_joints, device=device).view(1, 1, -1).expand(batch_size, num_frames, -1)
+    mask = ranks < num_mask
+    
+    real_mask = torch.zeros_like(mask).scatter_(-1, ids_shuffle, mask)
+    return real_mask
+
+class MaskedSkeletonAutoencoder(nn.Module):
+    def __init__(self, encoder, d_model, max_frames, in_channels=2):
+        super().__init__()
+        self.encoder = encoder
+        self.mask_token = nn.Parameter(torch.randn(d_model) * 0.02)
+        self.decoder = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, max_frames * in_channels)
+        )
+        self.max_frames = max_frames
+        self.in_channels = in_channels
+        
+    def forward(self, x, mask):
+        B, C, T, N = x.shape
+        x_embed = x.permute(0, 2, 3, 1).contiguous()
+        x_embed = self.encoder.physical_embedding(x_embed)
+        
+        mask_expanded = mask.unsqueeze(-1)
+        x_embed = torch.where(mask_expanded, self.mask_token, x_embed)
+        
+        x_spatial = x_embed.permute(0, 3, 1, 2).contiguous()
+        for ha_gc_block in self.encoder.spatial_branch:
+            x_spatial = ha_gc_block(x_spatial)
+        x_spatial = x_spatial.mean(dim=2)
+        x_spatial = x_spatial.transpose(1, 2)
+        
+        x_temporal = x_embed.mean(dim=2)
+        A_final = self.encoder.adaptive_graph(x_temporal)
+        for mhsa_layer in self.encoder.temporal_branch:
+            x_temporal, attn_weights = mhsa_layer(x_temporal, graph_adjacency=A_final)
+            
+        x_fused = self.encoder.cross_fusion(x_spatial, x_temporal)
+        
+        out = self.decoder(x_fused)
+        out = out.view(B, N, self.max_frames, self.in_channels)
+        out = out[:, :, :T, :]
+        out = out.permute(0, 2, 1, 3).contiguous()
+        
+        return out
+
+def pretrain_epoch(autoencoder, loader, optimizer, scheduler, device, epoch, scaler=None):
+    autoencoder.train()
+    total_loss = 0.0
+    use_amp = (device.type == 'cuda' and scaler is not None)
+    
+    progress_bar = tqdm(loader, desc=f"Epoch {epoch+1} [Pre-train]")
+    for step, (batch_data, _) in enumerate(progress_bar):
+        batch_data = batch_data.to(device)
+        B, C, T, N = batch_data.shape
+        
+        mask = generate_mask_exact(B, T, N, device)
+        x_gt = batch_data.permute(0, 2, 3, 1).contiguous()
+        
+        if use_amp:
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                x_pred = autoencoder(batch_data, mask)
+                mask_expanded = mask.unsqueeze(-1).expand_as(x_gt)
+                loss = F.mse_loss(x_pred[mask_expanded], x_gt[mask_expanded])
+            
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(autoencoder.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            scheduler.step()
+        else:
+            x_pred = autoencoder(batch_data, mask)
+            mask_expanded = mask.unsqueeze(-1).expand_as(x_gt)
+            loss = F.mse_loss(x_pred[mask_expanded], x_gt[mask_expanded])
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(autoencoder.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            scheduler.step()
+            
+        total_loss += loss.item()
+        progress_bar.set_postfix({'loss': f"{loss.item():.6f}"})
+        
+    return total_loss / len(loader)
+
+def load_pretrained_encoder(model, pretrained_path, device):
+    print(f"Loading pre-trained encoder weights from {pretrained_path}...")
+    checkpoint = torch.load(pretrained_path, map_location=device)
+    
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        pretrained_dict = checkpoint['model_state_dict']
+    else:
+        pretrained_dict = checkpoint
+        
+    pretrained_dict = {k: v for k, v in pretrained_dict.items() if not k.startswith('classifier')}
+    model_dict = model.state_dict()
+    
+    for stream_name in ['stream_joint', 'stream_bone', 'stream_velocity']:
+        mapped_dict = {}
+        for k, v in pretrained_dict.items():
+            mapped_key = f"{stream_name}.{k}"
+            if mapped_key in model_dict:
+                mapped_dict[mapped_key] = v
+                
+        model.load_state_dict(mapped_dict, strict=False)
+        print(f"  Initialized {stream_name} with pre-trained encoder weights.")
+
+def get_dataset_labels(dataset):
+    if isinstance(dataset, torch.utils.data.Subset):
+        base_dataset = dataset.dataset
+        base_labels = get_dataset_labels(base_dataset)
+        return [base_labels[i] for i in dataset.indices]
+        
+    if isinstance(dataset, torch.utils.data.TensorDataset):
+        return dataset.tensors[1].tolist()
+        
+    if hasattr(dataset, 'labels'):
+        return list(dataset.labels)
+        
+    if hasattr(dataset, 'files'):
+        return [item[1] for item in dataset.files]
+        
+    raise ValueError("Could not extract labels from dataset of type " + str(type(dataset)))
 
 def train_epoch(model, loader, criterion, optimizer, scheduler, device, epoch, scaler=None):
     model.train()
@@ -310,7 +466,132 @@ def main():
     else:
         train_loader, val_loader, test_loader = get_dummy_loaders(args)
         
-    # Build model
+    # GradScaler for Automatic Mixed Precision (AMP)
+    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+
+    # =========================================================================
+    # STAGE 1: Self-Supervised Pre-Training (Masked Skeleton Autoencoder - MSA)
+    # =========================================================================
+    if args.pretrain:
+        print("=" * 70)
+        print("STAGE 1: SELF-SUPERVISED PRE-TRAINING (MASKED SKELETON AUTOENCODER)")
+        print("=" * 70)
+        
+        # Combine train & val datasets for pre-training (as val has no supervision anyway)
+        from torch.utils.data import ConcatDataset
+        combined_dataset = ConcatDataset([train_loader.dataset, val_loader.dataset])
+        
+        dataloader_kwargs = {
+            'batch_size': args.batch_size,
+            'num_workers': train_loader.num_workers,
+            'pin_memory': train_loader.pin_memory
+        }
+        if train_loader.num_workers > 0:
+            dataloader_kwargs['prefetch_factor'] = train_loader.prefetch_factor
+            
+        combined_loader = DataLoader(
+            combined_dataset,
+            shuffle=True,
+            **dataloader_kwargs
+        )
+        
+        # Build base single-stream model
+        print("Building single-stream HA-GCT encoder...")
+        encoder = HA_GCT(
+            num_joints=args.num_point,
+            in_channels=args.in_channels,
+            d_model=128,
+            num_ha_gc_blocks=3,
+            num_mhsa_layers=2,
+            nhead=4,
+            dropout=0.1,  # Lower dropout for pre-training
+            graph_lambda=0.1,
+            max_frames=max_frames
+        ).to(device)
+        
+        autoencoder = MaskedSkeletonAutoencoder(
+            encoder=encoder,
+            d_model=128,
+            max_frames=max_frames,
+            in_channels=args.in_channels
+        ).to(device)
+        
+        optimizer = optim.AdamW(autoencoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        
+        steps_per_epoch = len(combined_loader)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.pretrain_epochs * steps_per_epoch, eta_min=1e-6
+        )
+        
+        os.makedirs(os.path.dirname(args.pretrain_path), exist_ok=True)
+        best_loss = float('inf')
+        
+        print("\nStarting self-supervised pre-training loops...")
+        for epoch in range(args.pretrain_epochs):
+            train_loss = pretrain_epoch(autoencoder, combined_loader, optimizer, scheduler, device, epoch, scaler)
+            print(f"Epoch {epoch+1}/{args.pretrain_epochs} - MSA Loss: {train_loss:.6f}")
+            
+            # Log to wandb
+            if use_wandb:
+                wandb.log({
+                    "pretrain_epoch": epoch + 1,
+                    "pretrain_loss": train_loss,
+                    "pretrain_lr": scheduler.get_last_lr()[0]
+                })
+                
+            if train_loss < best_loss:
+                best_loss = train_loss
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': autoencoder.encoder.state_dict(),
+                    'loss': best_loss
+                }, args.pretrain_path)
+                print(f"Saved best pre-trained encoder weights to {args.pretrain_path} with loss {best_loss:.6f}")
+                
+        print("\nSelf-supervised pre-training completed successfully!")
+        if use_wandb:
+            wandb.finish()
+        return
+
+    # =========================================================================
+    # STAGE 2: Fine-Tuning classification
+    # =========================================================================
+    # Class-Balanced Sampling
+    if args.class_balanced:
+        print("Enabling Class-Balanced Sampling using WeightedRandomSampler...")
+        labels = get_dataset_labels(train_loader.dataset)
+        labels_tensor = torch.tensor(labels, dtype=torch.long)
+        
+        unique_labels, counts = torch.unique(labels_tensor, return_counts=True)
+        max_class_id = int(torch.max(labels_tensor).item())
+        
+        class_weights = torch.zeros(max_class_id + 1, dtype=torch.float)
+        for l, c in zip(unique_labels, counts):
+            class_weights[l] = 1.0 / float(c)
+            
+        sample_weights = class_weights[labels_tensor]
+        
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True
+        )
+        
+        dataloader_kwargs = {
+            'batch_size': train_loader.batch_size,
+            'num_workers': train_loader.num_workers,
+            'pin_memory': train_loader.pin_memory,
+        }
+        if train_loader.num_workers > 0:
+            dataloader_kwargs['prefetch_factor'] = train_loader.prefetch_factor
+            
+        train_loader = DataLoader(
+            train_loader.dataset,
+            sampler=sampler,
+            **dataloader_kwargs
+        )
+
+    # Build classification model
     print("Building Multi-Stream HA-GCT model...")
     model = MultiStreamHA_GCT(
         num_joints=args.num_point,
@@ -325,8 +606,38 @@ def main():
         max_frames=max_frames
     ).to(device)
     
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # Load pre-trained weights if provided and exists
+    pretrained_loaded = False
+    if args.pretrain_path and os.path.exists(args.pretrain_path):
+        load_pretrained_encoder(model, args.pretrain_path, device)
+        pretrained_loaded = True
+    else:
+        print("No pre-trained encoder found or specified. Training from scratch.")
+        
+    # Set Loss Function
+    if args.loss_fn == 'focal':
+        print("Using Focal Loss instead of CrossEntropyLoss...")
+        criterion = FocalLoss(gamma=2.0, label_smoothing=0.1)
+    else:
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        
+    # Set up optimizer with separate learning rates if pre-trained weights were loaded
+    if pretrained_loaded:
+        encoder_params = []
+        classifier_params = []
+        for name, param in model.named_parameters():
+            if 'classifier' in name:
+                classifier_params.append(param)
+            else:
+                encoder_params.append(param)
+        
+        optimizer = optim.AdamW([
+            {'params': encoder_params, 'lr': 1e-4},
+            {'params': classifier_params, 'lr': 3e-4}
+        ], weight_decay=args.weight_decay)
+        print("Configured separate optimizer learning rates: Encoder lr = 1e-4, Classifier lr = 3e-4")
+    else:
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
     # Sequential learning rate scheduler with Linear Warm-up & Cosine Annealing Warm Restarts (Step-based)
     ACCUM_STEPS = 4
@@ -357,9 +668,6 @@ def main():
         milestones=[warmup_steps]
     )
     
-    # GradScaler for Automatic Mixed Precision (AMP)
-    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
-    
     start_epoch = 0
     best_acc = -1.0
     
@@ -385,7 +693,6 @@ def main():
                 print(f"Restored best validation accuracy: {best_acc * 100:.2f}%")
         else:
             model.load_state_dict(checkpoint)
-            # Try parsing epoch from filename e.g. ha_gct_epoch_10.pth
             filename = os.path.basename(args.resume)
             if 'epoch_' in filename:
                 try:
@@ -395,8 +702,6 @@ def main():
                     print(f"Parsed epoch from filename. Resuming training from epoch {start_epoch + 1}")
                 except Exception:
                     pass
-            # Fast-forward scheduler if no state dict is loaded
-            # Fast-forward scheduler if no state dict is loaded
             for _ in range(start_epoch * steps_per_epoch):
                 scheduler.step()
                 

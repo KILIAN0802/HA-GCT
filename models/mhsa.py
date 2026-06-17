@@ -82,10 +82,10 @@ class MHSA_Block(nn.Module):
     
     def __init__(
         self,
-        d_model=256,
-        nhead=8,
+        d_model=128,
+        nhead=4,
         num_joints=27,
-        d_ff=1024,
+        d_ff=512,
         dropout=0.1,
         graph_lambda=0.1,
         num_layers=2
@@ -155,10 +155,10 @@ class MHSAEncoderLayer(nn.Module):
     
     def __init__(
         self,
-        d_model=256,
-        nhead=8,
+        d_model=128,
+        nhead=4,
         num_joints=27,
-        d_ff=1024,
+        d_ff=512,
         dropout=0.1,
         graph_lambda=0.1,
         drop_path_prob=0.0
@@ -181,7 +181,7 @@ class MHSAEncoderLayer(nn.Module):
         # Sub-layer 2: FFN Block
         self.ffn = Conv1D_FFN(
             d_model=d_model, 
-            d_ff=d_model * 4, 
+            d_ff=d_ff, 
             dropout=dropout
         )
         # LayerNorm cho sub-layer 2
@@ -231,8 +231,8 @@ class GraphAugmentedAttention(nn.Module):
     
     def __init__(
         self,
-        d_model=256,
-        nhead=8,
+        d_model=128,
+        nhead=4,
         num_joints=27,
         dropout=0.1,
         graph_lambda=0.1
@@ -304,6 +304,9 @@ class GraphAugmentedAttention(nn.Module):
         attn_outputs = []
         attn_weights_list = []
         
+        # Partition heads into 4 equal groups for the 4 different strategies
+        group_size = max(1, self.nhead // 4)
+        
         for head_idx in range(self.nhead):
             q_h = Q[:, head_idx:head_idx+1, :, :]  # (B, 1, T, d_k)
             k_h = K[:, head_idx:head_idx+1, :, :]
@@ -314,24 +317,24 @@ class GraphAugmentedAttention(nn.Module):
             
             # ========== APPLY HEAD-SPECIFIC STRATEGIES ==========
             
-            if head_idx in [0, 1]:
-                # HEAD 1-2: LOCAL TEMPORAL ATTENTION
+            if head_idx < group_size:
+                # LOCAL TEMPORAL ATTENTION
                 # Chỉ attend đến các frames lân cận
                 attn_scores = self._apply_local_mask(attn_scores, self.local_window_size)
                 
-            elif head_idx in [2, 3]:
-                # HEAD 3-4: LONG-RANGE TEMPORAL ATTENTION
+            elif head_idx < 2 * group_size:
+                # LONG-RANGE TEMPORAL ATTENTION
                 # Dilated attention - nhảy cách
                 attn_scores = self._apply_dilated_attention(attn_scores, self.dilation_rate)
                 
-            elif head_idx in [4, 5]:
-                # HEAD 5-6: MOTION TRAJECTORY ATTENTION
+            elif head_idx < 3 * group_size:
+                # MOTION TRAJECTORY ATTENTION
                 # Tính attention dựa trên motion features
                 motion_scores = self._compute_motion_attention(x, q_h, k_h, head_idx)
                 attn_scores = attn_scores + 0.5 * motion_scores
                 
             else:
-                # HEAD 7-8: GLOBAL CONTEXT ATTENTION
+                # GLOBAL CONTEXT ATTENTION
                 # Attend toàn bộ sequence (không làm gì thêm)
                 pass
             
