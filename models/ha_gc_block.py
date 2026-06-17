@@ -9,6 +9,23 @@ import math
 from graph.sign_27 import Graph as SpatialGraph
 from graph.sign_27_A_hands import Graph as HandsGraph
 
+def drop_path(x, drop_prob=0.0, training=False):
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor = torch.floor(random_tensor + keep_prob)
+    return x / keep_prob * random_tensor
+
+class DropPath(nn.Module):
+    def __init__(self, drop_prob=0.0):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
+
 class HA_GC_Block(nn.Module):
     """
     HA-GC Block (Hand-Aware Graph Convolution Block)
@@ -17,7 +34,7 @@ class HA_GC_Block(nn.Module):
     Input: (B, C_in, T, V)
     Output: (B, C_out, T, V)
     """
-    def __init__(self, in_channels, out_channels, num_joints=27, num_subset=3):
+    def __init__(self, in_channels, out_channels, num_joints=27, num_subset=3, drop_path_prob=0.0):
         super().__init__()
         
         self.num_joints = num_joints
@@ -55,6 +72,7 @@ class HA_GC_Block(nn.Module):
             
         self.bn = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU(inplace=True)
+        self.drop_path = DropPath(drop_path_prob)
         
         self._init_weights()
         
@@ -96,7 +114,7 @@ class HA_GC_Block(nn.Module):
             y = z + y if y is not None else z
             
         y = self.bn(y)
-        y += self.res(x)
+        y = self.res(x) + self.drop_path(y)
         
         return self.relu(y)
 

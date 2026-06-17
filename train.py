@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -41,6 +42,7 @@ def parse_args():
     parser.add_argument('--dataset', type=str, default='vsl400', choices=['vsl400', 'multivsl200'], help='Dataset selection')
     parser.add_argument('--split-method', type=str, default='random', choices=['random', 'signer'], help='MultiVSL200 dataset split method')
     parser.add_argument('--resume', type=str, default='', help='Path to checkpoint to resume training from')
+    parser.add_argument('--tta', action='store_true', help='Use Test-Time Augmentation (TTA) during evaluation')
     return parser.parse_args()
 
 def check_dataset_exists(data_dir):
@@ -159,13 +161,21 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, device, epoch, s
     return total_loss / len(loader), correct / total
 
 @torch.no_grad()
-def eval_model(model, loader, criterion, device, desc="[Val]"):
+def eval_model(model, loader, criterion, device, desc="[Val]", use_tta=False):
     model.eval()
     total_loss = 0.0
     correct = 0
     total = 0
     
     use_amp = (device.type == 'cuda')
+    
+    def perturb_speed(batch, rate):
+        B, C, T, V = batch.shape
+        x = batch.permute(0, 1, 3, 2).reshape(B, C * V, T)
+        new_T = max(2, int(T * rate))
+        x_resampled = F.interpolate(x, size=new_T, mode='linear', align_corners=False)
+        x_final = F.interpolate(x_resampled, size=T, mode='linear', align_corners=False)
+        return x_final.reshape(B, C, V, T).permute(0, 1, 3, 2)
     
     progress_bar = tqdm(loader, desc=desc)
     for batch_data, batch_labels in progress_bar:
@@ -174,10 +184,52 @@ def eval_model(model, loader, criterion, device, desc="[Val]"):
         
         if use_amp:
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                outputs = model(batch_data)
+                if use_tta:
+                    out_orig = model(batch_data)
+                    
+                    batch_flipped = batch_data.clone()
+                    batch_flipped[:, 0, :, :] = -batch_flipped[:, 0, :, :]
+                    out_flipped = model(batch_flipped)
+                    
+                    batch_speed_09 = perturb_speed(batch_data, 0.9)
+                    out_speed_09 = model(batch_speed_09)
+                    
+                    batch_speed_11 = perturb_speed(batch_data, 1.1)
+                    out_speed_11 = model(batch_speed_11)
+                    
+                    prob_orig = F.softmax(out_orig, dim=-1)
+                    prob_flipped = F.softmax(out_flipped, dim=-1)
+                    prob_speed_09 = F.softmax(out_speed_09, dim=-1)
+                    prob_speed_11 = F.softmax(out_speed_11, dim=-1)
+                    
+                    prob_avg = (prob_orig + prob_flipped + prob_speed_09 + prob_speed_11) / 4.0
+                    outputs = torch.log(torch.clamp(prob_avg, min=1e-12))
+                else:
+                    outputs = model(batch_data)
                 loss = criterion(outputs, batch_labels)
         else:
-            outputs = model(batch_data)
+            if use_tta:
+                out_orig = model(batch_data)
+                
+                batch_flipped = batch_data.clone()
+                batch_flipped[:, 0, :, :] = -batch_flipped[:, 0, :, :]
+                out_flipped = model(batch_flipped)
+                
+                batch_speed_09 = perturb_speed(batch_data, 0.9)
+                out_speed_09 = model(batch_speed_09)
+                
+                batch_speed_11 = perturb_speed(batch_data, 1.1)
+                out_speed_11 = model(batch_speed_11)
+                
+                prob_orig = F.softmax(out_orig, dim=-1)
+                prob_flipped = F.softmax(out_flipped, dim=-1)
+                prob_speed_09 = F.softmax(out_speed_09, dim=-1)
+                prob_speed_11 = F.softmax(out_speed_11, dim=-1)
+                
+                prob_avg = (prob_orig + prob_flipped + prob_speed_09 + prob_speed_11) / 4.0
+                outputs = torch.log(torch.clamp(prob_avg, min=1e-12))
+            else:
+                outputs = model(batch_data)
             loss = criterion(outputs, batch_labels)
         
         total_loss += loss.item()
@@ -266,7 +318,7 @@ def main():
         d_model=128,
         num_ha_gc_blocks=3,
         num_mhsa_layers=2,
-        nhead=8,
+        nhead=4,
         num_classes=args.num_classes,
         dropout=0.5,
         graph_lambda=0.1,
@@ -355,7 +407,7 @@ def main():
     print("\nStarting training loops...")
     for epoch in range(start_epoch, args.epochs):
         train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch, scaler)
-        val_loss, val_acc = eval_model(model, val_loader, criterion, device, desc=f"Epoch {epoch+1} [Val]")
+        val_loss, val_acc = eval_model(model, val_loader, criterion, device, desc=f"Epoch {epoch+1} [Val]", use_tta=args.tta)
         
         # Log to tensorboard
         writer.add_scalar('Loss/train', train_loss, epoch)
@@ -409,7 +461,7 @@ def main():
     best_checkpoint = torch.load(os.path.join(run_save_dir, 'best_ha_gct_model.pth'), map_location=device)
     model.load_state_dict(best_checkpoint['model_state_dict'])
     
-    test_loss, test_acc = eval_model(model, test_loader, criterion, device, desc="[Test]")
+    test_loss, test_acc = eval_model(model, test_loader, criterion, device, desc="[Test]", use_tta=args.tta)
     print(f"Final Test Result - Loss: {test_loss:.4f}, Acc: {test_acc*100:.2f}%")
     
     if use_wandb:

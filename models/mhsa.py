@@ -125,9 +125,24 @@ class MHSA_Block(nn.Module):
         return x, attn_weights_list
 
 
+def drop_path(x, drop_prob=0.0, training=False):
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor = torch.floor(random_tensor + keep_prob)
+    return x / keep_prob * random_tensor
+
+class DropPath(nn.Module):
+    def __init__(self, drop_prob=0.0):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
+
 class MHSAEncoderLayer(nn.Module):
-
-
     """
     Single Encoder Layer trong MHSA Block
     
@@ -145,7 +160,8 @@ class MHSAEncoderLayer(nn.Module):
         num_joints=27,
         d_ff=1024,
         dropout=0.1,
-        graph_lambda=0.1
+        graph_lambda=0.1,
+        drop_path_prob=0.0
     ):
         super().__init__()
         
@@ -171,6 +187,7 @@ class MHSAEncoderLayer(nn.Module):
         # LayerNorm cho sub-layer 2
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout2 = nn.Dropout(dropout)
+        self.drop_path = DropPath(drop_path_prob)
     
     def forward(self, x, mask=None, graph_adjacency=None):
         """
@@ -188,16 +205,16 @@ class MHSAEncoderLayer(nn.Module):
         x_norm = self.norm1(x)
         attn_output, attn_weights = self.self_attn(x_norm, mask, graph_adjacency)
         
-        # Residual connection + Dropout
-        x = x + self.dropout1(attn_output)
+        # Residual connection + Dropout + DropPath
+        x = x + self.drop_path(self.dropout1(attn_output))
         
         # ========== SUB-LAYER 2: FFN ==========
         # Pre-LN architecture
         x_norm = self.norm2(x)
         ffn_output = self.ffn(x_norm)
         
-        # Residual connection + Dropout
-        x = x + self.dropout2(ffn_output)
+        # Residual connection + Dropout + DropPath
+        x = x + self.drop_path(self.dropout2(ffn_output))
         
         return x, attn_weights
 

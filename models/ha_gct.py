@@ -47,10 +47,13 @@ class HA_GCT(nn.Module):
             dropout=dropout
         )
         
-        # 2. SPATIAL BRANCH: HA-GC Blocks (x3)
+        # 2. SPATIAL BRANCH: HA-GC Blocks (x3) with Stochastic Depth (DropPath)
+        total_layers = num_ha_gc_blocks + num_mhsa_layers
+        dpr = [0.1 + (0.3 - 0.1) * i / max(1, total_layers - 1) for i in range(total_layers)]
+        
         self.spatial_branch = nn.ModuleList([
-            HA_GC_Block(d_model, d_model, num_joints)
-            for _ in range(num_ha_gc_blocks)
+            HA_GC_Block(d_model, d_model, num_joints, drop_path_prob=dpr[i])
+            for i in range(num_ha_gc_blocks)
         ])
         
         # 3. TEMPORAL BRANCH: MHSA Blocks (x2)
@@ -62,9 +65,10 @@ class HA_GCT(nn.Module):
                 num_joints=num_joints,
                 d_ff=d_model * 4,
                 dropout=dropout,
-                graph_lambda=graph_lambda
+                graph_lambda=graph_lambda,
+                drop_path_prob=dpr[num_ha_gc_blocks + i]
             )
-            for _ in range(num_mhsa_layers)
+            for i in range(num_mhsa_layers)
         ])
         
         # 4. ADAPTIVE GRAPH REFINEMENT
