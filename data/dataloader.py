@@ -26,14 +26,14 @@ class VSLDataset(Dataset):
         if is_train:
             self.augmentor = SpatialAugmentation(
                 num_joints=27,
-                mask_prob=0.3,        # Increased from 0.1 to 0.3
-                num_mask_joints=2,    # Mask 2 joints
-                bone_scale=0.05,      # ±5% bone length
-                noise_std=0.01,       # Random Gaussian Noise
-                noise_prob=0.5,
-                shift_max=5,          # Random Temporal Shift/Crop
-                shift_prob=0.5,
-                crop_min_ratio=0.8,
+                mask_prob=0.5,
+                num_mask_joints=4,
+                bone_scale=0.15,
+                noise_std=0.04,
+                noise_prob=0.7,
+                shift_max=15,
+                shift_prob=0.7,
+                crop_min_ratio=0.6,
                 crop_prob=0.5
             )
         else:
@@ -115,14 +115,14 @@ class MultiVSL200Dataset(Dataset):
         if is_train:
             self.augmentor = SpatialAugmentation(
                 num_joints=27,
-                mask_prob=0.3,
-                num_mask_joints=2,
-                bone_scale=0.05,
-                noise_std=0.01,
-                noise_prob=0.5,
-                shift_max=5,
-                shift_prob=0.5,
-                crop_min_ratio=0.8,
+                mask_prob=0.5,
+                num_mask_joints=4,
+                bone_scale=0.15,
+                noise_std=0.04,
+                noise_prob=0.7,
+                shift_max=15,
+                shift_prob=0.7,
+                crop_min_ratio=0.6,
                 crop_prob=0.5
             )
         else:

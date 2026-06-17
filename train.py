@@ -18,15 +18,15 @@ except ImportError:
 sys.path.extend(['./', '../'])
 
 from data.dataloader import get_dataloaders
-from models.ha_gct import HA_GCT
+from models.ha_gct import MultiStreamHA_GCT
 
 def parse_args():
     parser = argparse.ArgumentParser(description="HA-GCT Training Pipeline")
     parser.add_argument('--data-dir', type=str, default='data/400VSL/processed/27_direct', help='Path to dataset directory')
-    parser.add_argument('--epochs', type=int, default=50, help='Number of epochs to train')
+    parser.add_argument('--epochs', type=int, default=200, help='Number of epochs to train')
     parser.add_argument('--batch-size', type=int, default=16, help='Batch size')
     parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
-    parser.add_argument('--weight-decay', type=float, default=1e-2, help='Weight decay')
+    parser.add_argument('--weight-decay', type=float, default=0.05, help='Weight decay')
     parser.add_argument('--num-classes', type=int, default=400, help='Number of action classes')
     parser.add_argument('--num-point', type=int, default=27, help='Number of skeleton joints')
     parser.add_argument('--num-person', type=int, default=2, help='Number of persons in skeleton')
@@ -81,7 +81,7 @@ def get_dummy_loaders(args):
     
     return train_loader, val_loader, test_loader
 
-def train_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None):
+def train_epoch(model, loader, criterion, optimizer, scheduler, device, epoch, scaler=None):
     model.train()
     total_loss = 0.0
     correct = 0
@@ -91,13 +91,13 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None)
     
     # Thiết lập tham số Mixup
     mixup_alpha = 0.2
+    ACCUM_STEPS = 4  # Tích lũy gradient qua 4 bước
     
+    optimizer.zero_grad()
     progress_bar = tqdm(loader, desc=f"Epoch {epoch+1} [Train]")
-    for batch_data, batch_labels in progress_bar:
+    for step, (batch_data, batch_labels) in enumerate(progress_bar):
         batch_data = batch_data.to(device)
         batch_labels = batch_labels.to(device)
-        
-        optimizer.zero_grad()
         
         # ==========================================
         # MIXUP AUGMENTATION
@@ -118,16 +118,31 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None)
                 # Tính tổng loss của 2 nhãn được trộn
                 loss = lam * criterion(outputs, batch_labels) + (1 - lam) * criterion(outputs, batch_labels[index])
             
+            loss = loss / ACCUM_STEPS
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            
+            if (step + 1) % ACCUM_STEPS == 0 or (step + 1) == len(loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                scheduler.step()
         else:
             outputs = model(mixed_data)
             loss = lam * criterion(outputs, batch_labels) + (1 - lam) * criterion(outputs, batch_labels[index])
+            
+            loss = loss / ACCUM_STEPS
             loss.backward()
-            optimizer.step()
+            
+            if (step + 1) % ACCUM_STEPS == 0 or (step + 1) == len(loader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+                scheduler.step()
         
-        total_loss += loss.item()
+        loss_val = loss.item() * ACCUM_STEPS
+        total_loss += loss_val
         
         # Tính Accuracy (tính trên nhãn chiếm tỷ trọng lớn hơn lam > 0.5)
         _, predicted = outputs.max(1)
@@ -137,7 +152,7 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None)
         correct += predicted.eq(target_label).sum().item()
         
         progress_bar.set_postfix({
-            'loss': f"{loss.item():.4f}",
+            'loss': f"{loss_val:.4f}",
             'acc': f"{100. * correct / total:.2f}%"
         })
         
@@ -244,8 +259,8 @@ def main():
         train_loader, val_loader, test_loader = get_dummy_loaders(args)
         
     # Build model
-    print("Building HA-GCT model...")
-    model = HA_GCT(
+    print("Building Multi-Stream HA-GCT model...")
+    model = MultiStreamHA_GCT(
         num_joints=args.num_point,
         in_channels=args.in_channels,
         d_model=128,
@@ -261,21 +276,33 @@ def main():
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
-    # Sequential learning rate scheduler with Linear Warm-up & Cosine Annealing
-    warmup_epochs = 10 if args.epochs >= 20 else 5
+    # Sequential learning rate scheduler with Linear Warm-up & Cosine Annealing Warm Restarts (Step-based)
+    ACCUM_STEPS = 4
+    steps_per_epoch = max(1, (len(train_loader) + ACCUM_STEPS - 1) // ACCUM_STEPS)
+    
+    warmup_epochs = 15
     if args.dummy_test:
         warmup_epochs = 2
         
+    warmup_steps = warmup_epochs * steps_per_epoch
+    
+    # Cosine Annealing Warm Restarts parameters
+    T_0_epochs = 50
+    T_0_steps = T_0_epochs * steps_per_epoch
+    
+    # start_factor to scale from 1e-6 to args.lr (default 3e-4)
+    start_factor = 1e-6 / args.lr
+        
     warmup_scheduler = optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs
+        optimizer, start_factor=start_factor, end_factor=1.0, total_iters=warmup_steps
     )
-    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, args.epochs - warmup_epochs), eta_min=1e-6
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=T_0_steps, T_mult=1, eta_min=1e-6
     )
     scheduler = optim.lr_scheduler.SequentialLR(
         optimizer,
         schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[warmup_epochs]
+        milestones=[warmup_steps]
     )
     
     # GradScaler for Automatic Mixed Precision (AMP)
@@ -317,7 +344,8 @@ def main():
                 except Exception:
                     pass
             # Fast-forward scheduler if no state dict is loaded
-            for _ in range(start_epoch):
+            # Fast-forward scheduler if no state dict is loaded
+            for _ in range(start_epoch * steps_per_epoch):
                 scheduler.step()
                 
     os.makedirs(run_save_dir, exist_ok=True)
@@ -326,10 +354,8 @@ def main():
     
     print("\nStarting training loops...")
     for epoch in range(start_epoch, args.epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, epoch, scaler)
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch, scaler)
         val_loss, val_acc = eval_model(model, val_loader, criterion, device, desc=f"Epoch {epoch+1} [Val]")
-        
-        scheduler.step()
         
         # Log to tensorboard
         writer.add_scalar('Loss/train', train_loss, epoch)

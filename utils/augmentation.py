@@ -1,5 +1,8 @@
 import numpy as np
 import random
+import math
+import torch
+import torch.nn.functional as F
 
 class SpatialAugmentation:
     """
@@ -21,7 +24,12 @@ class SpatialAugmentation:
         shift_max=5,
         shift_prob=0.5,
         crop_min_ratio=0.8,
-        crop_prob=0.5
+        crop_prob=0.5,
+        rot_max_angle=20.0,
+        rot_prob=0.6,
+        speed_min_rate=0.7,
+        speed_max_rate=1.3,
+        speed_prob=0.5
     ):
         self.num_joints = num_joints
         self.mask_prob = mask_prob
@@ -33,6 +41,11 @@ class SpatialAugmentation:
         self.shift_prob = shift_prob
         self.crop_min_ratio = crop_min_ratio
         self.crop_prob = crop_prob
+        self.rot_max_angle = rot_max_angle
+        self.rot_prob = rot_prob
+        self.speed_min_rate = speed_min_rate
+        self.speed_max_rate = speed_max_rate
+        self.speed_prob = speed_prob
         
         # Define parents for anatomically consistent bone scaling
         self.parents = {
@@ -83,6 +96,19 @@ class SpatialAugmentation:
         """
         # Make a copy to avoid in-place modification of dataset
         sample = sample.copy()
+        
+        # Convert to PyTorch tensor for the new augmentations (expects (T, V, C))
+        C, T, V = sample.shape
+        skeleton_tensor = torch.from_numpy(sample).permute(1, 2, 0).float()
+        
+        # A1. Speed Perturbation (called first)
+        skeleton_tensor = self._apply_speed_perturbation(skeleton_tensor)
+        
+        # A2. Body Rotation (called second)
+        skeleton_tensor = self._apply_random_rotation(skeleton_tensor)
+        
+        # Convert back to NumPy array of shape (C, T, V)
+        sample = skeleton_tensor.permute(2, 0, 1).numpy()
         
         # 1. Bone Scaling
         if self.bone_scale > 0:
@@ -224,6 +250,39 @@ class SpatialAugmentation:
             for v in range(V):
                 new_sample[c, :, v] = np.interp(x_new, x_old, cropped_sample[c, :, v])
         return new_sample
+
+    def _apply_random_rotation(self, skeleton):
+        if random.random() > self.rot_prob:
+            return skeleton
+        angle = random.uniform(-self.rot_max_angle, self.rot_max_angle) * math.pi / 180.0
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        R = torch.tensor([[cos_a, -sin_a], [sin_a, cos_a]], dtype=skeleton.dtype)
+        
+        # Translate to make joint 0 (root) at (0, 0) for each frame
+        root_coords = skeleton[:, 0:1, :2].clone() # shape (T, 1, 2)
+        skeleton_centered = skeleton[:, :, :2] - root_coords
+        
+        # Apply rotation
+        rotated = skeleton_centered @ R.T
+        
+        # Copy back and translate back
+        skeleton = skeleton.clone()
+        skeleton[:, :, :2] = rotated + root_coords
+        return skeleton
+
+    def _apply_speed_perturbation(self, skeleton):
+        if random.random() > self.speed_prob:
+            return skeleton
+        T = skeleton.shape[0]
+        rate = random.uniform(self.speed_min_rate, self.speed_max_rate)
+        new_T = max(2, int(T * rate))
+        
+        x = skeleton.permute(2, 1, 0).unsqueeze(0)  # (1, C, V, T)
+        x = x.reshape(1, -1, T)
+        x_resampled = F.interpolate(x, size=new_T, mode='linear', align_corners=False)
+        x_final = F.interpolate(x_resampled, size=T, mode='linear', align_corners=False)
+        return x_final.squeeze(0).reshape(skeleton.shape[2], skeleton.shape[1], T).permute(2, 1, 0)
+
 
 if __name__ == '__main__':
     print("=" * 70)
