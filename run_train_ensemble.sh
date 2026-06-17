@@ -14,6 +14,10 @@ BATCH_SIZE=16
 LR="3e-4"
 WANDB_PROJECT="HA-GCT"
 
+# Pre-training configurations
+PRETRAIN_EPOCHS=50
+PRETRAIN_PATH="checkpoints/pretrained_ha_gct.pth"
+
 # Export CUDA device
 export CUDA_VISIBLE_DEVICES=$GPU_ID
 
@@ -26,6 +30,34 @@ echo "Start time: $(date)"
 echo "=============================================================================="
 
 # ------------------------------------------------------------------------------
+# STAGE 1: SELF-SUPERVISED PRE-TRAINING (MASKED SKELETON AUTOENCODER)
+# Runs once to generate the pre-trained encoder weights if not already present.
+# ------------------------------------------------------------------------------
+if [ ! -f "$PRETRAIN_PATH" ]; then
+    echo "Pre-trained weights not found at $PRETRAIN_PATH."
+    echo "Starting Stage 1: Self-Supervised Pre-training (MSA) for $PRETRAIN_EPOCHS epochs..."
+    START_PRE=$(date +%s)
+    python train.py \
+        --dataset $DATASET \
+        --data-dir $DATA_DIR \
+        --pretrain \
+        --pretrain-epochs $PRETRAIN_EPOCHS \
+        --pretrain-path $PRETRAIN_PATH \
+        --batch-size $BATCH_SIZE \
+        --lr $LR \
+        --wandb-project $WANDB_PROJECT \
+        --use-wandb
+    END_PRE=$(date +%s)
+    echo "Stage 1 Pre-training completed. Duration: $((END_PRE - START_PRE))s"
+else
+    echo "Pre-trained weights found at $PRETRAIN_PATH. Skipping Stage 1 Pre-training."
+fi
+
+# ==============================================================================
+# STAGE 2: FINE-TUNING CLASSIFICATION (5 MODELS)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
 # MODEL 1: seed=42, augmentation set A (crop_min=0.6), multistream
 # ------------------------------------------------------------------------------
 echo ""
@@ -34,6 +66,7 @@ START_M1=$(date +%s)
 python train.py \
     --dataset $DATASET \
     --data-dir $DATA_DIR \
+    --pretrain-path $PRETRAIN_PATH \
     --seed 42 \
     --crop-min-ratio 0.6 \
     --model-type multistream \
@@ -55,6 +88,7 @@ START_M2=$(date +%s)
 python train.py \
     --dataset $DATASET \
     --data-dir $DATA_DIR \
+    --pretrain-path $PRETRAIN_PATH \
     --seed 123 \
     --crop-min-ratio 0.6 \
     --model-type multistream \
@@ -76,6 +110,7 @@ START_M3=$(date +%s)
 python train.py \
     --dataset $DATASET \
     --data-dir $DATA_DIR \
+    --pretrain-path $PRETRAIN_PATH \
     --seed 42 \
     --crop-min-ratio 0.5 \
     --model-type multistream \
@@ -89,7 +124,7 @@ END_M3=$(date +%s)
 echo "Model 3 completed. Duration: $((END_M3 - START_M3))s"
 
 # ------------------------------------------------------------------------------
-# MODEL 4: seed=42, augmentation set A (crop_min=0.6), earlyfusion
+# MODEL 4: seed=42, augmentation set A (crop_min=0.6), earlyfusion (train from scratch)
 # ------------------------------------------------------------------------------
 echo ""
 echo "[4/5] Training Model 4 (seed=42, crop_min=0.6, earlyfusion)..."
@@ -118,6 +153,7 @@ START_M5=$(date +%s)
 python train.py \
     --dataset $DATASET \
     --data-dir $DATA_DIR \
+    --pretrain-path $PRETRAIN_PATH \
     --seed 42 \
     --crop-min-ratio 0.6 \
     --model-type multistream \

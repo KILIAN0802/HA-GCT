@@ -290,10 +290,10 @@ class EarlyFusionHA_GCT(nn.Module):
     ):
         super().__init__()
         
-        # The base single-stream HA_GCT model with 3 * in_channels = 6 channels
-        self.encoder = HA_GCT(
+        # Initialize a SINGLE instance of HA_GCT named self.ha_gct with in_channels=in_channels * 3
+        self.ha_gct = HA_GCT(
             num_joints=num_joints,
-            in_channels=3 * in_channels,
+            in_channels=in_channels * 3,
             d_model=d_model,
             num_ha_gc_blocks=num_ha_gc_blocks,
             num_mhsa_layers=num_mhsa_layers,
@@ -306,12 +306,37 @@ class EarlyFusionHA_GCT(nn.Module):
         
         # Skeleton topology mapping for bone calculation
         self.parents = {
-            0: None, 1: 0, 2: 0, 3: 1, 4: 2, 5: 3, 6: 4, 7: 5, 17: 6,
-            8: 7, 9: 7, 10: 9, 11: 7, 12: 11, 13: 7, 14: 13, 15: 7, 16: 15,
-            18: 17, 19: 17, 20: 19, 21: 17, 22: 21, 23: 17, 24: 23, 25: 17, 26: 25
+            0: None,   # Nose / Root
+            1: 0,      # Shoulder L
+            2: 0,      # Shoulder R
+            3: 1,      # Elbow L
+            4: 2,      # Elbow R
+            5: 3,      # Wrist L
+            6: 4,      # Wrist R
+            7: 5,      # Palm L
+            17: 6,     # Palm R
+            8: 7,      # Thumb L
+            9: 7,      # Index L root
+            10: 9,     # Index L tip
+            11: 7,     # Middle L root
+            12: 11,    # Middle L tip
+            13: 7,     # Ring L root
+            14: 13,    # Ring L tip
+            15: 7,     # Pinky L root
+            16: 15,    # Pinky L tip
+            18: 17,    # Thumb R
+            19: 17,    # Index R root
+            20: 19,    # Index R tip
+            21: 17,    # Middle R root
+            22: 21,    # Middle R tip
+            23: 17,    # Ring R root
+            24: 23,    # Ring R tip
+            25: 17,    # Pinky R root
+            26: 25     # Pinky R tip
         }
         
     def _compute_bone(self, joint):
+        # joint shape: (B, C, T, V)
         B, C, T, V = joint.shape
         bone = torch.zeros_like(joint)
         for child, parent in self.parents.items():
@@ -320,6 +345,7 @@ class EarlyFusionHA_GCT(nn.Module):
         return bone
 
     def _compute_velocity(self, joint):
+        # joint shape: (B, C, T, V)
         B, C, T, V = joint.shape
         velocity = torch.zeros_like(joint)
         velocity[:, :, 1:, :] = joint[:, :, 1:, :] - joint[:, :, :-1, :]
@@ -330,12 +356,11 @@ class EarlyFusionHA_GCT(nn.Module):
         bone = self._compute_bone(joint)
         velocity = self._compute_velocity(joint)
         
-        # Concatenate along channel dimension: (B, 6, T, V)
+        # Concatenate them: x = torch.cat([joint, bone, velocity], dim=1) -> Shape becomes (B, 6, T, V)
         x = torch.cat([joint, bone, velocity], dim=1)
         
-        # Pass to the 6-channel encoder
-        output = self.encoder(x)
-        return output
+        # Return the output of self.ha_gct(x)
+        return self.ha_gct(x)
 
 if __name__ == '__main__':
     print("=" * 70)
@@ -399,5 +424,30 @@ if __name__ == '__main__':
     print(f"Multi-Stream Output shape: {ms_output.shape}")
     assert ms_output.shape == (batch_size, num_classes), "Incorrect Multi-Stream output shape!"
     print("\nMULTI-STREAM HA-GCT TEST PASSED!")
+    print("=" * 70)
+    
+    # Test Early Fusion
+    print("\n" + "=" * 70)
+    print("TESTING EARLY FUSION HA-GCT")
+    print("=" * 70)
+    
+    ef_model = EarlyFusionHA_GCT(
+        num_joints=num_joints,
+        in_channels=in_channels,
+        d_model=128,
+        num_ha_gc_blocks=3,
+        num_mhsa_layers=2,
+        nhead=8,
+        num_classes=num_classes,
+        dropout=0.5,
+        graph_lambda=0.1,
+        max_frames=num_frames
+    )
+    
+    print(f"Early Fusion HA-GCT Parameters: {sum(p.numel() for p in ef_model.parameters()):,}")
+    ef_output = ef_model(x)
+    print(f"Early Fusion Output shape: {ef_output.shape}")
+    assert ef_output.shape == (batch_size, num_classes), "Incorrect Early Fusion output shape!"
+    print("\nEARLY FUSION HA-GCT TEST PASSED!")
     print("=" * 70)
 
