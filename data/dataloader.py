@@ -8,7 +8,7 @@ from utils.preprocessing import SkeletonTransforms
 
 class VSLDataset(Dataset):
     """Dataset cho 400VSL với Augmentation"""
-    def __init__(self, data_path, label_path, transform=None, is_train=True):
+    def __init__(self, data_path, label_path, transform=None, is_train=True, crop_min_ratio=0.6):
         self.data = np.load(data_path)
         with open(label_path, 'rb') as f:
             self.labels = pickle.load(f)
@@ -33,7 +33,7 @@ class VSLDataset(Dataset):
                 noise_prob=0.7,
                 shift_max=15,
                 shift_prob=0.7,
-                crop_min_ratio=0.6,
+                crop_min_ratio=crop_min_ratio,
                 crop_prob=0.5
             )
         else:
@@ -62,9 +62,9 @@ class VSLDataset(Dataset):
             return torch.FloatTensor(sample), torch.LongTensor([label]).squeeze() #squeeze dùng để bỏ chiều dư thừa
 
 
-def get_dataloaders(data_dir, batch_size=32, num_workers=4, transform=None):
+def get_dataloaders(data_dir, batch_size=32, num_workers=4, transform=None, crop_min_ratio=0.6):
     #Create train, val, test dataset  
-    train_dataset = VSLDataset(f'{data_dir}/train_data_joint.npy', f'{data_dir}/train_label.pkl', transform=transform, is_train=True)
+    train_dataset = VSLDataset(f'{data_dir}/train_data_joint.npy', f'{data_dir}/train_label.pkl', transform=transform, is_train=True, crop_min_ratio=crop_min_ratio)
     val_dataset = VSLDataset(f'{data_dir}/val_data_joint.npy', f'{data_dir}/val_label.pkl', transform=transform, is_train=False)
     test_dataset = VSLDataset(f'{data_dir}/test_data_joint.npy', f'{data_dir}/test_label.pkl', transform=transform, is_train=False)
     
@@ -85,7 +85,7 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, transform=None):
 
 class MultiVSL200Dataset(Dataset):
     """Dataset for MultiVSL200 loading individual npy files"""
-    def __init__(self, data_dir, transform=None, signer_ids=None, is_train=True):
+    def __init__(self, data_dir, transform=None, signer_ids=None, is_train=True, crop_min_ratio=0.6):
         self.data_dir = data_dir
         self.transform = transform
         self.is_train = is_train
@@ -122,7 +122,7 @@ class MultiVSL200Dataset(Dataset):
                 noise_prob=0.7,
                 shift_max=15,
                 shift_prob=0.7,
-                crop_min_ratio=0.6,
+                crop_min_ratio=crop_min_ratio,
                 crop_prob=0.5
             )
         else:
@@ -157,7 +157,7 @@ class MultiVSL200Dataset(Dataset):
             return torch.FloatTensor(sample), torch.tensor(label, dtype=torch.long)
 
 
-def get_multivsl_loaders(data_dir, batch_size=32, num_workers=4, transform=None, split_method='random'):
+def get_multivsl_loaders(data_dir, batch_size=32, num_workers=4, transform=None, split_method='random', crop_min_ratio=0.6):
     if split_method == 'signer':
         # Split by signer (Cross-signer evaluation)
         all_signers = ['02', '03', '04', '05', '06', '07-Phu', '08', '09', '10', '12', '13', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '24', '26', '27', '28', '30', '31']
@@ -165,12 +165,12 @@ def get_multivsl_loaders(data_dir, batch_size=32, num_workers=4, transform=None,
         val_signers = all_signers[21:24]
         test_signers = all_signers[24:]
         
-        train_dataset = MultiVSL200Dataset(data_dir, transform=transform, signer_ids=train_signers, is_train=True)
+        train_dataset = MultiVSL200Dataset(data_dir, transform=transform, signer_ids=train_signers, is_train=True, crop_min_ratio=crop_min_ratio)
         val_dataset = MultiVSL200Dataset(data_dir, transform=transform, signer_ids=val_signers, is_train=False)
         test_dataset = MultiVSL200Dataset(data_dir, transform=transform, signer_ids=test_signers, is_train=False)
     else:
         # Random split (80% train, 10% val, 10% test)
-        full_dataset = MultiVSL200Dataset(data_dir, transform=transform)
+        full_dataset = MultiVSL200Dataset(data_dir, transform=transform, crop_min_ratio=crop_min_ratio)
         total_len = len(full_dataset)
         train_len = int(0.8 * total_len)
         val_len = int(0.1 * total_len)

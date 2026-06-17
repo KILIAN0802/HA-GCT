@@ -271,6 +271,72 @@ class MultiStreamHA_GCT(nn.Module):
         output = self.classifier(feat_fused)
         return output
 
+class EarlyFusionHA_GCT(nn.Module):
+    """
+    Early Fusion HA-GCT (Concatenation of Joint, Bone, and Velocity as in_channels = 6)
+    """
+    def __init__(
+        self,
+        num_joints=27,
+        in_channels=2,
+        d_model=128,
+        num_ha_gc_blocks=3,
+        num_mhsa_layers=2,
+        nhead=4,
+        num_classes=400,
+        dropout=0.5,
+        graph_lambda=0.1,
+        max_frames=100
+    ):
+        super().__init__()
+        
+        # The base single-stream HA_GCT model with 3 * in_channels = 6 channels
+        self.encoder = HA_GCT(
+            num_joints=num_joints,
+            in_channels=3 * in_channels,
+            d_model=d_model,
+            num_ha_gc_blocks=num_ha_gc_blocks,
+            num_mhsa_layers=num_mhsa_layers,
+            nhead=nhead,
+            num_classes=num_classes,
+            dropout=dropout,
+            graph_lambda=graph_lambda,
+            max_frames=max_frames
+        )
+        
+        # Skeleton topology mapping for bone calculation
+        self.parents = {
+            0: None, 1: 0, 2: 0, 3: 1, 4: 2, 5: 3, 6: 4, 7: 5, 17: 6,
+            8: 7, 9: 7, 10: 9, 11: 7, 12: 11, 13: 7, 14: 13, 15: 7, 16: 15,
+            18: 17, 19: 17, 20: 19, 21: 17, 22: 21, 23: 17, 24: 23, 25: 17, 26: 25
+        }
+        
+    def _compute_bone(self, joint):
+        B, C, T, V = joint.shape
+        bone = torch.zeros_like(joint)
+        for child, parent in self.parents.items():
+            if parent is not None:
+                bone[:, :, :, child] = joint[:, :, :, child] - joint[:, :, :, parent]
+        return bone
+
+    def _compute_velocity(self, joint):
+        B, C, T, V = joint.shape
+        velocity = torch.zeros_like(joint)
+        velocity[:, :, 1:, :] = joint[:, :, 1:, :] - joint[:, :, :-1, :]
+        return velocity
+
+    def forward(self, joint):
+        # Compute streams dynamically on target device
+        bone = self._compute_bone(joint)
+        velocity = self._compute_velocity(joint)
+        
+        # Concatenate along channel dimension: (B, 6, T, V)
+        x = torch.cat([joint, bone, velocity], dim=1)
+        
+        # Pass to the 6-channel encoder
+        output = self.encoder(x)
+        return output
+
 if __name__ == '__main__':
     print("=" * 70)
     print("TESTING FULL UNIFIED HA-GCT NETWORK")

@@ -51,6 +51,12 @@ def parse_args():
     parser.add_argument('--class-balanced', action='store_true', help='Use WeightedRandomSampler for class balanced sampling')
     parser.add_argument('--loss-fn', type=str, default='ce', choices=['ce', 'focal'], help='Loss function selection')
     
+    # Phase 4 options
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--crop-min-ratio', type=float, default=0.6, help='Crop min ratio for spatial augmentation')
+    parser.add_argument('--d-model', type=int, default=128, help='d_model dimension')
+    parser.add_argument('--model-type', type=str, default='multistream', choices=['multistream', 'earlyfusion'], help='Model architecture selection')
+    
     return parser.parse_args()
 
 def check_dataset_exists(data_dir):
@@ -239,10 +245,39 @@ def get_dataset_labels(dataset):
         
     raise ValueError("Could not extract labels from dataset of type " + str(type(dataset)))
 
+def set_seed(seed):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def topk_accuracy_count(output, target, topk=(1, 5)):
+    with torch.no_grad():
+        num_classes = output.size(1)
+        actual_topk = [k for k in topk if k <= num_classes]
+        if not actual_topk:
+            return [0.0] * len(topk)
+        
+        maxk = max(actual_topk)
+        pred = output.topk(maxk, dim=1, largest=True, sorted=True).indices
+        correct = pred.eq(target.view(-1, 1).expand_as(pred))
+        res = []
+        for k in topk:
+            if k > num_classes:
+                res.append(float(target.size(0)))
+            else:
+                correct_k = correct[:, :k].reshape(-1).float().sum(0).item()
+                res.append(correct_k)
+        return res
+
 def train_epoch(model, loader, criterion, optimizer, scheduler, device, epoch, scaler=None):
     model.train()
     total_loss = 0.0
-    correct = 0
+    correct_top1 = 0
+    correct_top5 = 0
     total = 0
     
     use_amp = (device.type == 'cuda' and scaler is not None)
@@ -303,24 +338,27 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, device, epoch, s
         total_loss += loss_val
         
         # Tính Accuracy (tính trên nhãn chiếm tỷ trọng lớn hơn lam > 0.5)
-        _, predicted = outputs.max(1)
         target_label = batch_labels if lam >= 0.5 else batch_labels[index]
         
+        top1_c, top5_c = topk_accuracy_count(outputs, target_label)
+        correct_top1 += top1_c
+        correct_top5 += top5_c
         total += batch_labels.size(0)
-        correct += predicted.eq(target_label).sum().item()
         
         progress_bar.set_postfix({
             'loss': f"{loss_val:.4f}",
-            'acc': f"{100. * correct / total:.2f}%"
+            'acc_top1': f"{100. * correct_top1 / total:.2f}%",
+            'acc_top5': f"{100. * correct_top5 / total:.2f}%"
         })
         
-    return total_loss / len(loader), correct / total
+    return total_loss / len(loader), correct_top1 / total, correct_top5 / total
 
 @torch.no_grad()
 def eval_model(model, loader, criterion, device, desc="[Val]", use_tta=False):
     model.eval()
     total_loss = 0.0
-    correct = 0
+    correct_top1 = 0
+    correct_top5 = 0
     total = 0
     
     use_amp = (device.type == 'cuda')
@@ -389,19 +427,23 @@ def eval_model(model, loader, criterion, device, desc="[Val]", use_tta=False):
             loss = criterion(outputs, batch_labels)
         
         total_loss += loss.item()
-        _, predicted = outputs.max(1)
+        top1_c, top5_c = topk_accuracy_count(outputs, batch_labels)
+        correct_top1 += top1_c
+        correct_top5 += top5_c
         total += batch_labels.size(0)
-        correct += predicted.eq(batch_labels).sum().item()
         
         progress_bar.set_postfix({
             'loss': f"{loss.item():.4f}",
-            'acc': f"{100. * correct / total:.2f}%"
+            'acc_top1': f"{100. * correct_top1 / total:.2f}%",
+            'acc_top5': f"{100. * correct_top5 / total:.2f}%"
         })
         
-    return total_loss / len(loader), correct / total
+    return total_loss / len(loader), correct_top1 / total, correct_top5 / total
 
 def main():
     args = parse_args()
+    set_seed(args.seed)
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
@@ -412,9 +454,7 @@ def main():
     
     if args.resume and os.path.isfile(args.resume):
         is_resume = True
-        # Try to extract run_id from parent directory of the checkpoint file
         parent_dir = os.path.basename(os.path.dirname(args.resume))
-        # E.g. checkpoints/20260616_221935/best_ha_gct_model.pth -> parent_dir is '20260616_221935'
         if parent_dir and parent_dir != 'checkpoints':
             run_id = parent_dir
             print(f"Resuming run with ID: {run_id}")
@@ -456,12 +496,12 @@ def main():
             print(f"Loading MultiVSL200 dataloaders from {args.data_dir} with SkeletonTransforms...")
             from data.dataloader import get_multivsl_loaders
             train_loader, val_loader, test_loader = get_multivsl_loaders(
-                args.data_dir, batch_size=args.batch_size, num_workers=4, transform=transform, split_method=args.split_method
+                args.data_dir, batch_size=args.batch_size, num_workers=4, transform=transform, split_method=args.split_method, crop_min_ratio=args.crop_min_ratio
             )
         else:
             print(f"Loading 400VSL dataloaders from {args.data_dir} with SkeletonTransforms...")
             train_loader, val_loader, test_loader = get_dataloaders(
-                args.data_dir, batch_size=args.batch_size, num_workers=4, transform=transform
+                args.data_dir, batch_size=args.batch_size, num_workers=4, transform=transform, crop_min_ratio=args.crop_min_ratio
             )
     else:
         train_loader, val_loader, test_loader = get_dummy_loaders(args)
@@ -496,11 +536,11 @@ def main():
         )
         
         # Build base single-stream model
-        print("Building single-stream HA-GCT encoder...")
+        print(f"Building single-stream HA-GCT encoder with d_model={args.d_model}...")
         encoder = HA_GCT(
             num_joints=args.num_point,
             in_channels=args.in_channels,
-            d_model=128,
+            d_model=args.d_model,
             num_ha_gc_blocks=3,
             num_mhsa_layers=2,
             nhead=4,
@@ -511,7 +551,7 @@ def main():
         
         autoencoder = MaskedSkeletonAutoencoder(
             encoder=encoder,
-            d_model=128,
+            d_model=args.d_model,
             max_frames=max_frames,
             in_channels=args.in_channels
         ).to(device)
@@ -592,19 +632,34 @@ def main():
         )
 
     # Build classification model
-    print("Building Multi-Stream HA-GCT model...")
-    model = MultiStreamHA_GCT(
-        num_joints=args.num_point,
-        in_channels=args.in_channels,
-        d_model=128,
-        num_ha_gc_blocks=3,
-        num_mhsa_layers=2,
-        nhead=4,
-        num_classes=args.num_classes,
-        dropout=0.5,
-        graph_lambda=0.1,
-        max_frames=max_frames
-    ).to(device)
+    print(f"Building model type: {args.model_type} with d_model={args.d_model}...")
+    from models.ha_gct import EarlyFusionHA_GCT
+    if args.model_type == 'earlyfusion':
+        model = EarlyFusionHA_GCT(
+            num_joints=args.num_point,
+            in_channels=args.in_channels,
+            d_model=args.d_model,
+            num_ha_gc_blocks=3,
+            num_mhsa_layers=2,
+            nhead=4,
+            num_classes=args.num_classes,
+            dropout=0.5,
+            graph_lambda=0.1,
+            max_frames=max_frames
+        ).to(device)
+    else:
+        model = MultiStreamHA_GCT(
+            num_joints=args.num_point,
+            in_channels=args.in_channels,
+            d_model=args.d_model,
+            num_ha_gc_blocks=3,
+            num_mhsa_layers=2,
+            nhead=4,
+            num_classes=args.num_classes,
+            dropout=0.5,
+            graph_lambda=0.1,
+            max_frames=max_frames
+        ).to(device)
     
     # Load pre-trained weights if provided and exists
     pretrained_loaded = False
@@ -711,31 +766,35 @@ def main():
     
     print("\nStarting training loops...")
     for epoch in range(start_epoch, args.epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch, scaler)
-        val_loss, val_acc = eval_model(model, val_loader, criterion, device, desc=f"Epoch {epoch+1} [Val]", use_tta=args.tta)
+        train_loss, train_acc_top1, train_acc_top5 = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch, scaler)
+        val_loss, val_acc_top1, val_acc_top5 = eval_model(model, val_loader, criterion, device, desc=f"Epoch {epoch+1} [Val]", use_tta=args.tta)
         
         # Log to tensorboard
         writer.add_scalar('Loss/train', train_loss, epoch)
         writer.add_scalar('Loss/val', val_loss, epoch)
-        writer.add_scalar('Accuracy/train', train_acc, epoch)
-        writer.add_scalar('Accuracy/val', val_acc, epoch)
+        writer.add_scalar('Accuracy/train_top1', train_acc_top1, epoch)
+        writer.add_scalar('Accuracy/train_top5', train_acc_top5, epoch)
+        writer.add_scalar('Accuracy/val_top1', val_acc_top1, epoch)
+        writer.add_scalar('Accuracy/val_top5', val_acc_top5, epoch)
         
         # Log to wandb
         if use_wandb:
             wandb.log({
                 "epoch": epoch + 1,
                 "train_loss": train_loss,
-                "train_acc": train_acc,
+                "train_acc": train_acc_top1,
+                "train_acc_top5": train_acc_top5,
                 "val_loss": val_loss,
-                "val_acc": val_acc,
+                "val_acc": val_acc_top1,
+                "val_acc_top5": val_acc_top5,
                 "lr": scheduler.get_last_lr()[0]
             })
             
-        print(f"Epoch {epoch+1} Summary - Train Loss: {train_loss:.4f}, Train Acc: {train_acc*100:.2f}%, Val Loss: {val_loss:.4f}, Val Acc: {val_acc*100:.2f}%")
+        print(f"Epoch {epoch+1} Summary - Train Loss: {train_loss:.4f}, Train Acc (Top-1/Top-5): {train_acc_top1*100:.2f}%/{train_acc_top5*100:.2f}%, Val Loss: {val_loss:.4f}, Val Acc (Top-1/Top-5): {val_acc_top1*100:.2f}%/{val_acc_top5*100:.2f}%")
         
-        # Save best model
-        if val_acc > best_acc:
-            best_acc = val_acc
+        # Save best model based on Top-1
+        if val_acc_top1 > best_acc:
+            best_acc = val_acc_top1
             best_path = os.path.join(run_save_dir, 'best_ha_gct_model.pth')
             torch.save({
                 'epoch': epoch,
@@ -744,7 +803,7 @@ def main():
                 'scheduler_state_dict': scheduler.state_dict(),
                 'best_acc': best_acc,
             }, best_path)
-            print(f"New best model saved with Val Acc: {best_acc*100:.2f}%")
+            print(f"New best model saved with Val Acc (Top-1): {best_acc*100:.2f}%")
             if use_wandb:
                 wandb.save(best_path)
             
@@ -766,13 +825,14 @@ def main():
     best_checkpoint = torch.load(os.path.join(run_save_dir, 'best_ha_gct_model.pth'), map_location=device)
     model.load_state_dict(best_checkpoint['model_state_dict'])
     
-    test_loss, test_acc = eval_model(model, test_loader, criterion, device, desc="[Test]", use_tta=args.tta)
-    print(f"Final Test Result - Loss: {test_loss:.4f}, Acc: {test_acc*100:.2f}%")
+    test_loss, test_acc_top1, test_acc_top5 = eval_model(model, test_loader, criterion, device, desc="[Test]", use_tta=args.tta)
+    print(f"Final Test Result - Loss: {test_loss:.4f}, Acc (Top-1/Top-5): {test_acc_top1*100:.2f}%/{test_acc_top5*100:.2f}%")
     
     if use_wandb:
         wandb.log({
             "test_loss": test_loss,
-            "test_acc": test_acc
+            "test_acc": test_acc_top1,
+            "test_acc_top5": test_acc_top5
         })
         wandb.finish()
         
