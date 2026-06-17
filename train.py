@@ -89,6 +89,9 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None)
     
     use_amp = (device.type == 'cuda' and scaler is not None)
     
+    # Thiết lập tham số Mixup
+    mixup_alpha = 0.2
+    
     progress_bar = tqdm(loader, desc=f"Epoch {epoch+1} [Train]")
     for batch_data, batch_labels in progress_bar:
         batch_data = batch_data.to(device)
@@ -96,24 +99,42 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None)
         
         optimizer.zero_grad()
         
+        # ==========================================
+        # MIXUP AUGMENTATION
+        # ==========================================
+        if mixup_alpha > 0:
+            lam = np.random.beta(mixup_alpha, mixup_alpha)
+        else:
+            lam = 1.0
+            
+        # Trộn ngẫu nhiên các sample trong cùng 1 batch
+        index = torch.randperm(batch_data.size(0)).to(device)
+        mixed_data = lam * batch_data + (1 - lam) * batch_data[index]
+        # ==========================================
+        
         if use_amp:
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                outputs = model(batch_data)
-                loss = criterion(outputs, batch_labels)
+                outputs = model(mixed_data)
+                # Tính tổng loss của 2 nhãn được trộn
+                loss = lam * criterion(outputs, batch_labels) + (1 - lam) * criterion(outputs, batch_labels[index])
             
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
-            outputs = model(batch_data)
-            loss = criterion(outputs, batch_labels)
+            outputs = model(mixed_data)
+            loss = lam * criterion(outputs, batch_labels) + (1 - lam) * criterion(outputs, batch_labels[index])
             loss.backward()
             optimizer.step()
         
         total_loss += loss.item()
+        
+        # Tính Accuracy (tính trên nhãn chiếm tỷ trọng lớn hơn lam > 0.5)
         _, predicted = outputs.max(1)
+        target_label = batch_labels if lam >= 0.5 else batch_labels[index]
+        
         total += batch_labels.size(0)
-        correct += predicted.eq(batch_labels).sum().item()
+        correct += predicted.eq(target_label).sum().item()
         
         progress_bar.set_postfix({
             'loss': f"{loss.item():.4f}",
