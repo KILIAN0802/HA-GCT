@@ -13,14 +13,26 @@ class SpatialAugmentation:
     def __init__(
         self,
         num_joints=27,
-        mask_prob=0.1,
+        mask_prob=0.3,
         num_mask_joints=2,
-        bone_scale=0.05
+        bone_scale=0.05,
+        noise_std=0.01,
+        noise_prob=0.5,
+        shift_max=5,
+        shift_prob=0.5,
+        crop_min_ratio=0.8,
+        crop_prob=0.5
     ):
         self.num_joints = num_joints
         self.mask_prob = mask_prob
         self.num_mask_joints = num_mask_joints
         self.bone_scale = bone_scale
+        self.noise_std = noise_std
+        self.noise_prob = noise_prob
+        self.shift_max = shift_max
+        self.shift_prob = shift_prob
+        self.crop_min_ratio = crop_min_ratio
+        self.crop_prob = crop_prob
         
         # Define parents for anatomically consistent bone scaling
         self.parents = {
@@ -80,6 +92,18 @@ class SpatialAugmentation:
         if self.mask_prob > 0 and random.random() < self.mask_prob:
             sample = self._apply_joint_masking(sample)
             
+        # 3. Random Gaussian Noise
+        if self.noise_std > 0 and random.random() < self.noise_prob:
+            sample = self._apply_gaussian_noise(sample)
+            
+        # 4. Random Temporal Shift
+        if self.shift_max > 0 and random.random() < self.shift_prob:
+            sample = self._apply_temporal_shift(sample)
+            
+        # 5. Random Temporal Crop
+        if self.crop_min_ratio < 1.0 and random.random() < self.crop_prob:
+            sample = self._apply_temporal_crop(sample)
+            
         return sample
 
     def _apply_bone_scaling(self, sample):
@@ -134,6 +158,72 @@ class SpatialAugmentation:
                 sample[2, :, joint] = 0.0
                 
         return sample
+
+    def _apply_gaussian_noise(self, sample):
+        """
+        Adds random Gaussian noise to joint coordinates
+        """
+        C, T, V = sample.shape
+        # We only add noise to spatial dimensions (X, Y), which are channels 0 and 1
+        noise = np.random.normal(0, self.noise_std, size=(2, T, V))
+        sample[:2, :, :] += noise
+        return sample
+
+    def _apply_temporal_shift(self, sample):
+        """
+        Shifts the sequence temporally and pads/replicates boundaries
+        """
+        C, T, V = sample.shape
+        if T < 10:
+            return sample
+        
+        shift_max = min(self.shift_max, T // 5)
+        if shift_max < 1:
+            return sample
+            
+        shift = random.randint(-shift_max, shift_max)
+        if shift == 0:
+            return sample
+            
+        new_sample = np.zeros_like(sample)
+        if shift > 0:
+            # Shift right: copy [0, T-shift] to [shift, T]
+            new_sample[:, shift:, :] = sample[:, :-shift, :]
+            # Replicate the first frame for the padded part
+            new_sample[:, :shift, :] = sample[:, 0:1, :]
+        else:
+            # Shift left: copy [|shift|, T] to [0, T-|shift|]
+            abs_shift = abs(shift)
+            new_sample[:, :-abs_shift, :] = sample[:, abs_shift:, :]
+            # Replicate the last frame for the padded part
+            new_sample[:, -abs_shift:, :] = sample[:, -1:, :]
+            
+        return new_sample
+
+    def _apply_temporal_crop(self, sample):
+        """
+        Crops a temporal sub-sequence and interpolates it back to original length
+        """
+        C, T, V = sample.shape
+        if T < 15:
+            return sample
+            
+        crop_ratio = random.uniform(self.crop_min_ratio, 0.95)
+        crop_len = int(T * crop_ratio)
+        if crop_len >= T or crop_len < 5:
+            return sample
+            
+        start_idx = random.randint(0, T - crop_len)
+        cropped_sample = sample[:, start_idx:start_idx+crop_len, :]
+        
+        # Interpolate back to original length T
+        new_sample = np.zeros((C, T, V), dtype=sample.dtype)
+        x_old = np.linspace(0, 1, crop_len)
+        x_new = np.linspace(0, 1, T)
+        for c in range(C):
+            for v in range(V):
+                new_sample[c, :, v] = np.interp(x_new, x_old, cropped_sample[c, :, v])
+        return new_sample
 
 if __name__ == '__main__':
     print("=" * 70)

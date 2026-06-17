@@ -259,16 +259,17 @@ class Model(nn.Module):
         x = self.data_bn(x)
         x = x.view(N, M, V, C, T).permute(0, 1, 3, 4, 2).contiguous().view(N * M, C, T, V)  # 64, 3, 100, 27
 
-        x = self.l1(x, keep_prob=1.0)
-        x = self.l2(x, keep_prob=1.0)
-        x = self.l3(x, keep_prob=1.0)
-        x = self.l4(x, keep_prob=1.0)
-        x = self.l5(x, keep_prob=1.0)
-        x = self.l6(x, keep_prob=1.0)
-        x = self.l7(x, keep_prob)
-        x = self.l8(x, keep_prob)
-        x = self.l9(x, keep_prob)
-        x = self.l10(x, keep_prob)  
+        kp = keep_prob if self.training else 1.0
+        x = self.l1(x, keep_prob=kp)
+        x = self.l2(x, keep_prob=kp)
+        x = self.l3(x, keep_prob=kp)
+        x = self.l4(x, keep_prob=kp)
+        x = self.l5(x, keep_prob=kp)
+        x = self.l6(x, keep_prob=kp)
+        x = self.l7(x, keep_prob=kp)
+        x = self.l8(x, keep_prob=kp)
+        x = self.l9(x, keep_prob=kp)
+        x = self.l10(x, keep_prob=kp)  
         # print("after l10 ", x.shape)   # torch.Size([64, 256, 25, 27])
         # N*M,C,T,V
         c_new = x.size(1)   # c_new:  256

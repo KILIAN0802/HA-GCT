@@ -26,9 +26,15 @@ class VSLDataset(Dataset):
         if is_train:
             self.augmentor = SpatialAugmentation(
                 num_joints=27,
-                mask_prob=0.1,        # 10% chance to mask joints
+                mask_prob=0.3,        # Increased from 0.1 to 0.3
                 num_mask_joints=2,    # Mask 2 joints
-                bone_scale=0.05       # ±5% bone length
+                bone_scale=0.05,      # ±5% bone length
+                noise_std=0.01,       # Random Gaussian Noise
+                noise_prob=0.5,
+                shift_max=5,          # Random Temporal Shift/Crop
+                shift_prob=0.5,
+                crop_min_ratio=0.8,
+                crop_prob=0.5
             )
         else:
             self.augmentor = None
@@ -105,6 +111,23 @@ class MultiVSL200Dataset(Dataset):
             else:
                 self.files.append((f, label))
                 
+        # Initialize Augmentation (chỉ áp dụng khi train)
+        if is_train:
+            self.augmentor = SpatialAugmentation(
+                num_joints=27,
+                mask_prob=0.3,
+                num_mask_joints=2,
+                bone_scale=0.05,
+                noise_std=0.01,
+                noise_prob=0.5,
+                shift_max=5,
+                shift_prob=0.5,
+                crop_min_ratio=0.8,
+                crop_prob=0.5
+            )
+        else:
+            self.augmentor = None
+            
         print(f"Loaded {len(self.files)} samples from {data_dir} ({'Train' if is_train else 'Val/Test'})")
         
     def __len__(self):
@@ -117,6 +140,13 @@ class MultiVSL200Dataset(Dataset):
         # Load sample coordinates shape: (150, 27, 3)
         sample = np.load(file_path)
         
+        # Apply Spatial Augmentation (chỉ khi train)
+        if self.is_train and self.augmentor is not None:
+            # SpatialAugmentation expects (C, T, V) but loaded sample is (T, V, C)
+            sample = sample.transpose(2, 0, 1)
+            sample = self.augmentor(sample)
+            sample = sample.transpose(1, 2, 0)
+            
         # Apply transform (One Euro Filter + Smart Interpolation + reshape to (2, max_frames, 27))
         if self.transform:
             sample = self.transform(sample)

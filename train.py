@@ -26,7 +26,7 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=50, help='Number of epochs to train')
     parser.add_argument('--batch-size', type=int, default=16, help='Batch size')
     parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
-    parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay')
+    parser.add_argument('--weight-decay', type=float, default=1e-2, help='Weight decay')
     parser.add_argument('--num-classes', type=int, default=400, help='Number of action classes')
     parser.add_argument('--num-point', type=int, default=27, help='Number of skeleton joints')
     parser.add_argument('--num-person', type=int, default=2, help='Number of persons in skeleton')
@@ -227,17 +227,17 @@ def main():
     model = HA_GCT(
         num_joints=args.num_point,
         in_channels=args.in_channels,
-        d_model=256,
+        d_model=128,
         num_ha_gc_blocks=3,
         num_mhsa_layers=2,
         nhead=8,
         num_classes=args.num_classes,
-        dropout=0.1,
+        dropout=0.5,
         graph_lambda=0.1,
         max_frames=max_frames
     ).to(device)
     
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
     # Sequential learning rate scheduler with Linear Warm-up & Cosine Annealing
@@ -249,7 +249,7 @@ def main():
         optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs
     )
     cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs - warmup_epochs, eta_min=1e-6
+        optimizer, T_max=max(1, args.epochs - warmup_epochs), eta_min=1e-6
     )
     scheduler = optim.lr_scheduler.SequentialLR(
         optimizer,
