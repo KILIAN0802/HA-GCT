@@ -372,16 +372,15 @@ class GraphAugmentedAttention(nn.Module):
         Mask để chỉ attend đến các frames lân cận
         """
         B, h, T, _ = attn_scores.shape
+        device = attn_scores.device
         
-        # Create local mask
-        mask = torch.zeros(T, T, device=attn_scores.device)
-        for i in range(T):
-            start = max(0, i - window_size // 2)
-            end = min(T, i + window_size // 2 + 1)
-            mask[i, start:end] = 1
+        # Vectorized local mask construction
+        coords = torch.arange(T, device=device)
+        dist = torch.abs(coords.unsqueeze(0) - coords.unsqueeze(1))  # (T, T)
+        mask = dist <= window_size // 2
         
         # Apply mask
-        attn_scores = attn_scores.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
+        attn_scores = attn_scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float('-inf'))
         
         return attn_scores
     
@@ -390,15 +389,14 @@ class GraphAugmentedAttention(nn.Module):
         Dilated attention - chỉ attend đến các frames cách nhau dilation_rate
         """
         B, h, T, _ = attn_scores.shape
+        device = attn_scores.device
         
-        # Create dilated mask
-        mask = torch.zeros(T, T, device=attn_scores.device)
-        for i in range(T):
-            # Attend to frames at positions: i, i±dilation, i±2*dilation, ...
-            for j in range(0, T, dilation_rate):
-                mask[i, j] = 1
+        # Vectorized dilated mask construction (matches standard relative dilation: |i - j| % d == 0)
+        coords = torch.arange(T, device=device)
+        dist = torch.abs(coords.unsqueeze(0) - coords.unsqueeze(1))  # (T, T)
+        mask = (dist % dilation_rate == 0)
         
-        attn_scores = attn_scores.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
+        attn_scores = attn_scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float('-inf'))
         
         return attn_scores
     

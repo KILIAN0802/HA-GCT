@@ -49,8 +49,8 @@ class HA_GC_Block(nn.Module):
         
         # Define parameters matching unit_gcn in hand_aware_sl_lgcn.py
         self.PA = nn.Parameter(torch.from_numpy(A.astype(np.float32)))
-        self.A = torch.tensor(A, dtype=torch.float32, requires_grad=False)
-        self.A_hands = torch.tensor(A_hands, dtype=torch.float32, requires_grad=False)
+        self.register_buffer('A', torch.tensor(A, dtype=torch.float32))
+        self.register_buffer('A_hands', torch.tensor(A_hands, dtype=torch.float32))
         self.alpha = nn.Parameter(torch.tensor([0.5], dtype=torch.float32))
         
         self.PA_hands = nn.Parameter(torch.from_numpy(A_hands.astype(np.float32)))
@@ -96,10 +96,10 @@ class HA_GC_Block(nn.Module):
         """
         B, C, T, V = x.size()
         
-        # Load adjacency matrices onto device
-        A = self.A.to(x.device)
-        A_hands = self.A_hands.to(x.device)
-        PA_hands = self.PA_hands.to(x.device)
+        # Adjacency matrices are registered buffers/parameters, so they are already on the correct device
+        A = self.A
+        A_hands = self.A_hands
+        PA_hands = self.PA_hands
         
         # Dynamically refine graph with learnable alpha/beta and hand weights
         A = A + self.PA + A_hands * self.alpha + PA_hands * self.beta
