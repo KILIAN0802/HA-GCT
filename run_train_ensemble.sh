@@ -10,7 +10,7 @@ GPU_ID=3
 DATA_DIR="/mnt/nvme2/users/utbt_sv1/data/MultiVSL200/raw_npy"
 DATASET="multivsl200"
 EPOCHS=200
-BATCH_SIZE=16
+BATCH_SIZE=32
 LR="3e-4"
 WANDB_PROJECT="HA-GCT"
 

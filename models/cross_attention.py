@@ -57,7 +57,7 @@ class CrossAttentionFusion(nn.Module):
         self.dropout_t2s = nn.Dropout(dropout)
         
         # ========== FUSION PROJECTION LAYER ==========
-        self.fusion_proj = nn.Linear(d_model * 2, d_model)
+        self.fusion_proj = nn.Linear(d_model, d_model)
         
         # Residual connection
         self.residual_norm = nn.LayerNorm(d_model)
@@ -69,80 +69,13 @@ class CrossAttentionFusion(nn.Module):
     def forward(self, spatial_feat, temporal_feat):
         """
         Forward pass cho Cross-Attention Fusion
-        
-        Args:
-            spatial_feat: Tensor shape (B, N, D)
-                - B: batch size
-                - N: số lượng spatial tokens (27 joints)
-                - D: dimension (256)
-                - Từ HA-GC branch
-            
-            temporal_feat: Tensor shape (B, T, D)
-                - B: batch size
-                - T: số lượng temporal tokens (64 frames)
-                - D: dimension (256)
-                - Từ MHSA branch
-        
-        Returns:
-            fused_feat: Tensor shape (B, N, D)
-                - Features đã được fusion từ cả 2 branches
         """
-        
-        B, N, D = spatial_feat.shape
-        B, T, D = temporal_feat.shape
-        
-        # ========== DIRECTION 1: Spatial attends to Temporal ==========
-        # Q từ spatial, K và V từ temporal
-        # Mục đích: Mỗi joint "tìm kiếm" thông tin thời gian liên quan
-        spatial_attn_out, spatial_attn_weights = self.cross_attn_s2t(
-            query=spatial_feat,           # Q: (B, N, D)
-            key=temporal_feat,            # K: (B, T, D)
-            value=temporal_feat,          # V: (B, T, D)
-            need_weights=True,
-            average_attn_weights=False
-        )  # Output: (B, N, D)
-        
-        # Residual connection + LayerNorm
-        spatial_attn_out = self.dropout_s2t(spatial_attn_out)
-        spatial_attn_out = self.norm_s2t(spatial_feat + spatial_attn_out)
-        
-        # ========== DIRECTION 2: Temporal attends to Spatial ==========
-        # Q từ temporal, K và V từ spatial
-        # Mục đích: Mỗi frame "tìm kiếm" thông tin không gian liên quan
-        temporal_attn_out, temporal_attn_weights = self.cross_attn_t2s(
-            query=temporal_feat,          # Q: (B, T, D)
-            key=spatial_feat,             # K: (B, N, D)
-            value=spatial_feat,           # V: (B, N, D)
-            need_weights=True,
-            average_attn_weights=False
-        )  # Output: (B, T, D)
-        
-        # Residual connection + LayerNorm
-        temporal_attn_out = self.dropout_t2s(temporal_attn_out)
-        temporal_attn_out = self.norm_t2s(temporal_feat + temporal_attn_out)
-        
-        # ========== ALIGN DIMENSIONS ==========
-        # Nếu N != T, cần align về cùng kích thước
-        if N != T:
-            # Pool temporal để match spatial (N < T thường xảy ra)
-            # Dùng linear interpolation hoặc mean pooling
-            temporal_attn_out = self._align_dimensions(temporal_attn_out, target_len=N)
-            spatial_attn_out = self._align_dimensions(spatial_attn_out, target_len=N)
-        
-        # ========== FUSION ==========
-        # Kết hợp thông tin từ 2 directions bằng concatenation
-        combined = torch.cat([spatial_attn_out, temporal_attn_out], dim=-1)  # (B, N, 2D)
-        
-        fused_feat = self.fusion_proj(combined)  # (B, N, D)
+        temporal_pooled = temporal_feat.mean(dim=1, keepdim=True)
+        fused = spatial_feat + temporal_pooled
+        fused_feat = self.fusion_proj(fused)
         
         # Residual connection
         fused_feat = self.residual_norm(spatial_feat + fused_feat)
-        
-        # Store attention weights cho visualization
-        self.attn_weights = {
-            'spatial_to_temporal': spatial_attn_weights,  # (B, N, T)
-            'temporal_to_spatial': temporal_attn_weights  # (B, T, N)
-        }
         
         return fused_feat
     

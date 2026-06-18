@@ -57,7 +57,7 @@ def parse_args():
     parser.add_argument('--d-model', type=int, default=128, help='d_model dimension')
     parser.add_argument('--model-type', type=str, default='multistream', choices=['multistream', 'earlyfusion'], help='Model architecture selection')
     parser.add_argument('--mixup-alpha', type=float, default=0.0, help='Alpha parameter for Mixup augmentation (0.0 to disable)')
-    parser.add_argument('--warmup-epochs', type=int, default=3, help='Number of warmup epochs')
+    parser.add_argument('--warmup-epochs', type=int, default=1, help='Number of warmup epochs')
     parser.add_argument('--overfit-one-batch', action='store_true', help='Sanity check: train on a single batch for 500 steps to check convergence')
     
     return parser.parse_args()
@@ -689,10 +689,10 @@ def main():
                 encoder_params.append(param)
         
         optimizer = optim.AdamW([
-            {'params': encoder_params, 'lr': 1e-4},
+            {'params': encoder_params, 'lr': 3e-4},
             {'params': classifier_params, 'lr': 3e-4}
         ], weight_decay=args.weight_decay)
-        print("Configured separate optimizer learning rates: Encoder lr = 1e-4, Classifier lr = 3e-4")
+        print("Configured separate optimizer learning rates: Encoder lr = 3e-4, Classifier lr = 3e-4")
     else:
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     

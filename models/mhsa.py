@@ -221,12 +221,6 @@ class MHSAEncoderLayer(nn.Module):
 class GraphAugmentedAttention(nn.Module):
     """
     Multi-Head Self-Attention với các heads được thiết kế chuyên biệt (Graph-Augmented)
-    
-    Theo báo cáo tuần 17:
-    - Head 1-2: Local temporal (các khung lân cận)
-    - Head 3-4: Long-range temporal (các khung xa)
-    - Head 5-6: Motion trajectory (quỹ đạo chuyển động)
-    - Head 7-8: Global context (ngữ cảnh toàn cục)
     """
     
     def __init__(
@@ -251,23 +245,6 @@ class GraphAugmentedAttention(nn.Module):
         self.W_v = nn.Linear(d_model, d_model)
         self.W_o = nn.Linear(d_model, d_model)
         
-        # ========== HEAD-SPECIFIC CONFIGURATIONS ==========
-        
-        # Head 1-2: Local Temporal Attention
-        # Sử dụng local window masking
-        self.local_window_size = 5  # Chỉ attend đến 5 frames lân cận
-        
-        # Head 3-4: Long-range Temporal Attention
-        # Sử dụng dilated attention (nhảy cách)
-        self.dilation_rate = 3
-        
-        # Head 5-6: Motion Trajectory Attention
-        # Tính attention dựa trên velocity/acceleration
-        self.motion_fc = nn.Linear(d_model, d_model)
-        
-        # Head 7-8: Global Context Attention
-        # Attend đến toàn bộ sequence
-        
         # ========== GRAPH ADJACENCY ==========
         self.A_fix = self._init_skeleton_graph(num_joints)
         self.A_fix = nn.Parameter(self.A_fix, requires_grad=False)
@@ -286,7 +263,7 @@ class GraphAugmentedAttention(nn.Module):
     
     def forward(self, x, mask=None, graph_adjacency=None):
         """
-        Forward với các heads chuyên biệt
+        Forward pass for simplified Multi-Head Attention with Graph Adjacency
         """
         B, T, D = x.shape
         
@@ -295,134 +272,39 @@ class GraphAugmentedAttention(nn.Module):
         K = self.W_k(x)  # (B, T, D)
         V = self.W_v(x)  # (B, T, D)
         
-        # Reshape for multi-head
-        Q = Q.view(B, T, self.nhead, self.d_k).transpose(1, 2)  # (B, h, T, d_k)
+        # Reshape and transpose for multi-head: (B, h, T, d_k)
+        Q = Q.view(B, T, self.nhead, self.d_k).transpose(1, 2)
         K = K.view(B, T, self.nhead, self.d_k).transpose(1, 2)
         V = V.view(B, T, self.nhead, self.d_k).transpose(1, 2)
         
-        # Compute attention scores for each head
-        attn_outputs = []
-        attn_weights_list = []
+        # Standard scaled dot-product attention: (B, h, T, T)
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
         
-        # Partition heads into 4 equal groups for the 4 different strategies
-        group_size = max(1, self.nhead // 4)
+        # Add graph adjacency (shared or computed)
+        if graph_adjacency is not None:
+            A_final = graph_adjacency
+        else:
+            A_final = self._compute_graph_adjacency(x)  # (B, T, T)
+        A_final_expanded = A_final.unsqueeze(1)  # (B, 1, T, T)
         
-        for head_idx in range(self.nhead):
-            q_h = Q[:, head_idx:head_idx+1, :, :]  # (B, 1, T, d_k)
-            k_h = K[:, head_idx:head_idx+1, :, :]
-            v_h = V[:, head_idx:head_idx+1, :, :]
-            
-            # Compute base attention scores
-            attn_scores = torch.matmul(q_h, k_h.transpose(-2, -1)) / self.scale  # (B, 1, T, T)
-            
-            # ========== APPLY HEAD-SPECIFIC STRATEGIES ==========
-            
-            if head_idx < group_size:
-                # LOCAL TEMPORAL ATTENTION
-                # Chỉ attend đến các frames lân cận
-                attn_scores = self._apply_local_mask(attn_scores, self.local_window_size)
-                
-            elif head_idx < 2 * group_size:
-                # LONG-RANGE TEMPORAL ATTENTION
-                # Dilated attention - nhảy cách
-                attn_scores = self._apply_dilated_attention(attn_scores, self.dilation_rate)
-                
-            elif head_idx < 3 * group_size:
-                # MOTION TRAJECTORY ATTENTION
-                # Tính attention dựa trên motion features
-                motion_scores = self._compute_motion_attention(x, q_h, k_h, head_idx)
-                attn_scores = attn_scores + 0.5 * motion_scores
-                
-            else:
-                # GLOBAL CONTEXT ATTENTION
-                # Attend toàn bộ sequence (không làm gì thêm)
-                pass
-            
-            # Add graph adjacency (cho tất cả heads)
-            if graph_adjacency is not None:
-                A_final = graph_adjacency
-            else:
-                A_final = self._compute_graph_adjacency(x)  # (B, T, T)
-            A_final_expanded = A_final.unsqueeze(1)  # (B, 1, T, T)
-            attn_scores = attn_scores + self.graph_lambda * A_final_expanded
-            
-            # Softmax
-            attn_weights = F.softmax(attn_scores, dim=-1)  # (B, 1, T, T)
-            attn_weights = self.attn_dropout(attn_weights)
-            attn_weights_list.append(attn_weights)
-            
-            # Attend to values
-            attn_out = torch.matmul(attn_weights, v_h)  # (B, 1, T, d_k)
-            attn_outputs.append(attn_out)
+        # Add graph bias to attention scores
+        attn_scores = attn_scores + self.graph_lambda * A_final_expanded
         
-        # Concatenate all heads
-        attn_output = torch.cat(attn_outputs, dim=1)  # (B, h, T, d_k)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, D)  # (B, T, D)
+        # Softmax & Dropout
+        attn_weights = F.softmax(attn_scores, dim=-1)  # (B, h, T, T)
+        attn_weights = self.attn_dropout(attn_weights)
+        
+        # Attend to values: (B, h, T, d_k)
+        attn_output = torch.matmul(attn_weights, V)
+        
+        # Transpose and reshape back to (B, T, D)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, D)
         
         # Output projection
         output = self.W_o(attn_output)
         output = self.proj_dropout(output)
         
-        all_attn_weights = torch.cat(attn_weights_list, dim=1)  # (B, h, T, T)
-        
-        return output, all_attn_weights
-    
-    def _apply_local_mask(self, attn_scores, window_size):
-        """
-        Mask để chỉ attend đến các frames lân cận
-        """
-        B, h, T, _ = attn_scores.shape
-        device = attn_scores.device
-        
-        # Vectorized local mask construction
-        coords = torch.arange(T, device=device)
-        dist = torch.abs(coords.unsqueeze(0) - coords.unsqueeze(1))  # (T, T)
-        mask = dist <= window_size // 2
-        
-        # Apply mask
-        attn_scores = attn_scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float('-inf'))
-        
-        return attn_scores
-    
-    def _apply_dilated_attention(self, attn_scores, dilation_rate):
-        """
-        Dilated attention - chỉ attend đến các frames cách nhau dilation_rate
-        """
-        B, h, T, _ = attn_scores.shape
-        device = attn_scores.device
-        
-        # Vectorized dilated mask construction (matches standard relative dilation: |i - j| % d == 0)
-        coords = torch.arange(T, device=device)
-        dist = torch.abs(coords.unsqueeze(0) - coords.unsqueeze(1))  # (T, T)
-        mask = (dist % dilation_rate == 0)
-        
-        attn_scores = attn_scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float('-inf'))
-        
-        return attn_scores
-    
-    def _compute_motion_attention(self, x, q_h, k_h, head_idx):
-        """
-        Tính attention dựa trên motion features (velocity)
-        """
-        # Compute velocity (first derivative)
-        velocity = x[:, 1:, :] - x[:, :-1, :]  # (B, T-1, D)
-        velocity = F.pad(velocity, (0, 0, 0, 1), mode='replicate')  # (B, T, D)
-        
-        # Project velocity
-        vel_q = self.motion_fc(velocity)  # (B, T, D)
-        vel_k = self.motion_fc(velocity)
-        
-        # Compute motion-based attention
-        B, T, D = vel_q.shape
-        vel_q = vel_q.view(B, T, self.nhead, self.d_k).transpose(1, 2)  # (B, h, T, d_k)
-        vel_k = vel_k.view(B, T, self.nhead, self.d_k).transpose(1, 2)
-        
-        vel_q_h = vel_q[:, head_idx:head_idx+1, :, :]  # (B, 1, T, d_k)
-        vel_k_h = vel_k[:, head_idx:head_idx+1, :, :]  # (B, 1, T, d_k)
-        
-        motion_scores = torch.matmul(vel_q_h, vel_k_h.transpose(-2, -1)) / self.scale
-        
-        return motion_scores
+        return output, attn_weights
     
     def _compute_graph_adjacency(self, x):
         """Tính A_final = α·A_fix + β·A_dyn + γ·A_dep"""
