@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 import argparse
@@ -47,7 +48,8 @@ def parse_args():
     # Phase 3 options
     parser.add_argument('--pretrain', action='store_true', help='Run self-supervised pre-training (Stage 1)')
     parser.add_argument('--pretrain-epochs', type=int, default=50, help='Number of pre-training epochs')
-    parser.add_argument('--pretrain-path', type=str, default='checkpoints/pretrained_ha_gct.pth', help='Path to save/load pre-trained encoder weights')
+    # parser.add_argument('--pretrain-path', type=str, default='checkpoints/pretrained_ha_gct.pth', help='Path to save/load pre-trained encoder weights')
+    parser.add_argument('--pretrain-path', type=str, default='', help='Path to load pre-trained encoder weights')
     parser.add_argument('--class-balanced', action='store_true', help='Use WeightedRandomSampler for class balanced sampling')
     parser.add_argument('--loss-fn', type=str, default='ce', choices=['ce', 'focal'], help='Loss function selection')
     
@@ -57,6 +59,10 @@ def parse_args():
     parser.add_argument('--d-model', type=int, default=128, help='d_model dimension')
     parser.add_argument('--model-type', type=str, default='multistream', choices=['multistream', 'earlyfusion'], help='Model architecture selection')
     parser.add_argument('--mixup-alpha', type=float, default=0.1, help='Alpha parameter for Mixup augmentation (0.0 to disable)')
+    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
+    parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing for CrossEntropyLoss')
+    parser.add_argument('--classifier-lr-mult', type=float, default=2.0, help='Classifier LR multiplier')
+    parser.add_argument('--drop-path-max', type=float, default=0.0, help='Maximum DropPath probability')
     parser.add_argument('--warmup-epochs', type=int, default=5, help='Number of warmup epochs')
     parser.add_argument('--overfit-one-batch', action='store_true', help='Sanity check: train on a single batch for 500 steps to check convergence')
     
@@ -591,7 +597,8 @@ def main():
             nhead=4,
             dropout=0.1,  # Lower dropout for pre-training
             graph_lambda=0.1,
-            max_frames=max_frames
+            max_frames=max_frames,
+            drop_path_max=args.drop_path_max
         ).to(device)
         
         autoencoder = MaskedSkeletonAutoencoder(
@@ -688,9 +695,10 @@ def main():
             num_mhsa_layers=2,
             nhead=4,
             num_classes=args.num_classes,
-            dropout=0.5,
+            dropout=args.dropout,
             graph_lambda=0.05,
-            max_frames=max_frames
+            max_frames=max_frames,
+            drop_path_max=args.drop_path_max
         ).to(device)
     else:
         model = MultiStreamHA_GCT(
@@ -701,9 +709,10 @@ def main():
             num_mhsa_layers=2,
             nhead=4,
             num_classes=args.num_classes,
-            dropout=0.5,
+            dropout=args.dropout,
             graph_lambda=0.05,
-            max_frames=max_frames
+            max_frames=max_frames,
+            drop_path_max=args.drop_path_max
         ).to(device)
     
     # Load pre-trained weights if provided and exists
@@ -717,9 +726,9 @@ def main():
     # Set Loss Function
     if args.loss_fn == 'focal':
         print("Using Focal Loss instead of CrossEntropyLoss...")
-        criterion = FocalLoss(gamma=2.0, label_smoothing=0.1)
+        criterion = FocalLoss(gamma=2.0, label_smoothing=args.label_smoothing)
     else:
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
         
     # Set up optimizer with separate learning rates if pre-trained weights were loaded
     if pretrained_loaded:
@@ -731,11 +740,15 @@ def main():
             else:
                 encoder_params.append(param)
         
+        encoder_lr = args.lr
+        classifier_lr = args.lr * args.classifier_lr_mult
+
         optimizer = optim.AdamW([
-            {'params': encoder_params, 'lr': 3e-4},
-            {'params': classifier_params, 'lr': 3e-4}
+            {'params': encoder_params, 'lr': encoder_lr},
+            {'params': classifier_params, 'lr': classifier_lr}
         ], weight_decay=args.weight_decay)
-        print("Configured separate optimizer learning rates: Encoder lr = 3e-4, Classifier lr = 3e-4")
+
+        print(f"Configured separate optimizer learning rates: Encoder lr = {encoder_lr:g}, Classifier lr = {classifier_lr:g}")
     else:
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     

@@ -32,7 +32,8 @@ class HA_GCT(nn.Module):
         num_classes=400,         # 400VSL dataset
         dropout=0.1,
         graph_lambda=0.05,        # lambda in MHSA formula
-        max_frames=100
+        max_frames=100,
+        drop_path_max=0.0
     ):
         super().__init__()
         
@@ -47,7 +48,10 @@ class HA_GCT(nn.Module):
         
         # 2. SPATIAL BRANCH: HA-GC Blocks (x3) with Stochastic Depth (DropPath)
         total_layers = num_ha_gc_blocks + num_mhsa_layers
-        dpr = [0.1 + (0.3 - 0.1) * i / max(1, total_layers - 1) for i in range(total_layers)]
+        if drop_path_max > 0.0:
+            dpr = [drop_path_max * i / max(1, total_layers - 1) for i in range(total_layers)]
+        else:
+            dpr = [0.0] * total_layers
         
         self.spatial_branch = nn.ModuleList([
             HA_GC_Block(d_model, d_model, num_joints, drop_path_prob=dpr[i])
@@ -203,7 +207,8 @@ class MultiStreamHA_GCT(nn.Module):
         num_classes=400,
         dropout=0.5,
         graph_lambda=0.05,
-        max_frames=100
+        max_frames=100,
+        drop_path_max=0.0
     ):
         super().__init__()
         
@@ -218,7 +223,8 @@ class MultiStreamHA_GCT(nn.Module):
             num_classes=num_classes,
             dropout=dropout,
             graph_lambda=graph_lambda,
-            max_frames=max_frames
+            max_frames=max_frames,
+            drop_path_max=drop_path_max
         )
         
     def forward(self, joint):
@@ -240,7 +246,8 @@ class EarlyFusionHA_GCT(nn.Module):
         num_classes=400,
         dropout=0.5,
         graph_lambda=0.05,
-        max_frames=100
+        max_frames=100,
+        drop_path_max=0.0
     ):
         super().__init__()
         
@@ -255,7 +262,8 @@ class EarlyFusionHA_GCT(nn.Module):
             num_classes=num_classes,
             dropout=dropout,
             graph_lambda=graph_lambda,
-            max_frames=max_frames
+            max_frames=max_frames,
+            drop_path_max=drop_path_max
         )
         
         # Skeleton topology mapping for bone calculation
