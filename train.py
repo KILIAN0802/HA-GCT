@@ -497,6 +497,12 @@ def main():
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+    if device.type == 'cuda':
+        try:
+            free_mem, total_mem = torch.cuda.mem_get_info()
+            print(f"GPU Memory Status: Free: {free_mem / (1024**3):.2f} GB / Total: {total_mem / (1024**3):.2f} GB")
+        except Exception as e:
+            print(f"Could not retrieve GPU memory info: {e}")
     
     # Generate unique run ID based on timestamp or extract from checkpoint if resuming
     import datetime
