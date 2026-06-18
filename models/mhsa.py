@@ -220,7 +220,7 @@ class MHSAEncoderLayer(nn.Module):
 
 class GraphAugmentedAttention(nn.Module):
     """
-    Multi-Head Self-Attention với các heads được thiết kế chuyên biệt (Graph-Augmented)
+    Multi-Head Self-Attention (simplified standard version)
     """
     
     def __init__(
@@ -245,16 +245,6 @@ class GraphAugmentedAttention(nn.Module):
         self.W_v = nn.Linear(d_model, d_model)
         self.W_o = nn.Linear(d_model, d_model)
         
-        # ========== GRAPH ADJACENCY ==========
-        self.A_fix = self._init_skeleton_graph(num_joints)
-        self.A_fix = nn.Parameter(self.A_fix, requires_grad=False)
-        self.A_dyn = nn.Parameter(torch.randn(num_joints, num_joints))
-        self.fc_q_graph = nn.Linear(d_model, d_model)
-        self.fc_k_graph = nn.Linear(d_model, d_model)
-        self.alpha = nn.Parameter(torch.tensor(0.4))
-        self.beta = nn.Parameter(torch.tensor(0.3))
-        self.gamma = nn.Parameter(torch.tensor(0.3))
-        
         self.attn_dropout = nn.Dropout(dropout)
         self.proj_dropout = nn.Dropout(dropout)
         self.scale = math.sqrt(self.d_k)
@@ -263,7 +253,7 @@ class GraphAugmentedAttention(nn.Module):
     
     def forward(self, x, mask=None, graph_adjacency=None):
         """
-        Forward pass for simplified Multi-Head Attention with Graph Adjacency
+        Forward pass for standard Multi-Head Attention
         """
         B, T, D = x.shape
         
@@ -279,16 +269,6 @@ class GraphAugmentedAttention(nn.Module):
         
         # Standard scaled dot-product attention: (B, h, T, T)
         attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
-        
-        # Add graph adjacency (shared or computed)
-        if graph_adjacency is not None:
-            A_final = graph_adjacency
-        else:
-            A_final = self._compute_graph_adjacency(x)  # (B, T, T)
-        A_final_expanded = A_final.unsqueeze(1)  # (B, 1, T, T)
-        
-        # Add graph bias to attention scores
-        attn_scores = attn_scores + self.graph_lambda * A_final_expanded
         
         # Softmax & Dropout
         attn_weights = F.softmax(attn_scores, dim=-1)  # (B, h, T, T)
@@ -306,63 +286,12 @@ class GraphAugmentedAttention(nn.Module):
         
         return output, attn_weights
     
-    def _compute_graph_adjacency(self, x):
-        """Tính A_final = α·A_fix + β·A_dyn + γ·A_dep"""
-        B, T, D = x.shape
-        
-        if T != self.num_joints:
-            A_fix = F.interpolate(
-                self.A_fix.unsqueeze(0).unsqueeze(0).float(),
-                size=(T, T),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(0).squeeze(0)
-            A_dyn = F.interpolate(
-                self.A_dyn.unsqueeze(0).unsqueeze(0).float(),
-                size=(T, T),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(0).squeeze(0)
-        else:
-            A_fix = self.A_fix
-            A_dyn = self.A_dyn
-        
-        Q_graph = self.fc_q_graph(x)
-        K_graph = self.fc_k_graph(x)
-        A_dep = F.softmax(
-            torch.bmm(Q_graph, K_graph.transpose(1, 2)) / math.sqrt(D),
-            dim=-1
-        )
-        
-        A_final = (
-            self.alpha * A_fix.unsqueeze(0) +
-            self.beta * A_dyn.unsqueeze(0) +
-            self.gamma * A_dep
-        )
-        
-        return A_final
-    
-    def _init_skeleton_graph(self, num_joints):
-        A = torch.zeros(num_joints, num_joints)
-        connections = [
-            (0, 1), (0, 5), (0, 9), (0, 13), (0, 17),
-            (1, 2), (2, 3), (3, 4),
-            (5, 6), (6, 7), (7, 8),
-            (9, 10), (10, 11), (11, 12),
-            (13, 14), (14, 15), (15, 16),
-            (17, 18), (18, 19), (19, 20),
-        ]
-        for i, j in connections:
-            A[i, j] = 1
-            A[j, i] = 1
-        for i in range(num_joints):
-            A[i, i] = 1
-        return A
-    
     def _init_weights(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 # ========== TEST MODULES ==========
 
 if __name__ == '__main__':
@@ -399,14 +328,6 @@ if __name__ == '__main__':
     output, attn_weights = attn_module(x)
     print(f"\nOutput shape: {output.shape}")
     print(f"Attention weights shape: {attn_weights.shape}")
-    
-    # Check graph adjacency
-    print(f"\nGraph adjacency matrix:")
-    print(f"  A_fix shape: {attn_module.A_fix.shape}")
-    print(f"  A_dyn shape: {attn_module.A_dyn.shape}")
-    print(f"  Alpha: {attn_module.alpha.item():.3f}")
-    print(f"  Beta: {attn_module.beta.item():.3f}")
-    print(f"  Gamma: {attn_module.gamma.item():.3f}")
     
     # ========== Test 2: FFN Block ==========
     print("\n" + "=" * 70)

@@ -124,12 +124,16 @@ class unit_gcn(nn.Module):
         A_hands = self.A_hands.to(x.device)
         PA_hands = self.PA_hands.to(x.device)
         A = A + self.PA + A_hands * self.alpha + PA_hands * self.beta
+        A = torch.stack([
+            F.softmax(A[i], dim=-1)
+            for i in range(A.shape[0])
+        ])
 
         y = None
         for i in range(self.num_subset):
             f = self.conv[i](x)
-            N, C, T, V = f.size()
-            z = torch.matmul(f.view(N, C * T, V), A[i]).view(N, C, T, V)
+            # Matrix multiplication strictly over spatial dimension (V) using einsum
+            z = torch.einsum('bctv,vw->bctw', f, A[i])
             y = z + y if y is not None else z
 
         y = self.bn(y)

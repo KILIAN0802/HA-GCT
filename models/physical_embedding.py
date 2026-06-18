@@ -1,17 +1,18 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 
 class PhysicalEmbedding(nn.Module):
     """
     Physical Embedding Block for Skeleton Data (Linear Embed + Positional Embedding)
     
-    Transforms raw skeleton coordinates of shape (B, T, N, C) to (B, T, N, D)
+    Transforms raw skeleton coordinates of shape (B, C, T, V) to (B, T, V, D)
     where:
     - B: Batch size
-    - T: Number of frames
-    - N: Number of joints
     - C: Coordinate channels (x, y, [confidence])
+    - T: Number of frames
+    - V: Number of joints
     - D: Embedding dimension (d_model)
     """
     def __init__(self, in_channels, num_joints, d_model, max_frames=100, dropout=0.1):
@@ -26,32 +27,38 @@ class PhysicalEmbedding(nn.Module):
         # Learnable temporal positional embeddings for frames
         self.frame_embed = nn.Parameter(torch.randn(1, max_frames, 1, d_model) * 0.02)
         
+        self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
         """
         Args:
-            x: Input tensor shape (B, T, N, C)
+            x: Input tensor shape (B, C, T, V)
         Returns:
-            out: Embedded tensor shape (B, T, N, D)
+            out: Embedded tensor shape (B, T, V, D)
         """
-        B, T, N, C = x.shape
+        B, C, T, V = x.shape
         
-        # Permute to (B, C, T, N) for Conv2d
-        x = x.permute(0, 3, 1, 2).contiguous()
+        # Project coordinate channels: (B, C, T, V) -> (B, D, T, V)
+        x_proj = self.projection(x)
         
-        # Project coordinate channels: (B, C, T, N) -> (B, D, T, N)
-        x = self.projection(x)
+        # Permute to (B, T, V, D)
+        x_proj = x_proj.permute(0, 2, 3, 1).contiguous()
         
-        # Permute back to (B, T, N, D)
-        x = x.permute(0, 2, 3, 1).contiguous()
+        # Slice frame positional embedding to sequence length T
+        if T > self.frame_embed.shape[1]:
+            repeats = (T + self.frame_embed.shape[1] - 1) // self.frame_embed.shape[1]
+            pe_t = self.frame_embed.repeat(1, repeats, 1, 1)[:, :T, :, :]
+        else:
+            pe_t = self.frame_embed[:, :T, :, :]
         
         # Add joint and frame embeddings
-        # joint_embed is broadcasted across Batch and Time dimensions
-        # frame_embed is broadcasted across Batch and Joint dimensions
-        x = x + self.joint_embed[:, :, :N, :] + self.frame_embed[:, :T, :, :]
+        # joint_embed is broadcasted across Batch and Time dimensions: (1, 1, V, D)
+        # pe_t is broadcasted across Batch and Joint dimensions: (1, T, 1, D)
+        out = x_proj + self.joint_embed[:, :, :V, :] + pe_t
+        out = self.norm(out)
         
-        return self.dropout(x)
+        return self.dropout(out)
 
 if __name__ == '__main__':
     print("=" * 70)
@@ -65,9 +72,9 @@ if __name__ == '__main__':
     in_channels = 2
     d_model = 256
     
-    # Dummy input: (B, T, N, C)
-    x = torch.randn(batch_size, num_frames, num_joints, in_channels)
-    print(f"Input shape: {x.shape} (B, T, N, C)")
+    # Dummy input: (B, C, T, V)
+    x = torch.randn(batch_size, in_channels, num_frames, num_joints)
+    print(f"Input shape: {x.shape} (B, C, T, V)")
     
     # Initialize module
     embed = PhysicalEmbedding(
@@ -82,7 +89,7 @@ if __name__ == '__main__':
     
     # Forward pass
     output = embed(x)
-    print(f"Output shape: {output.shape} (B, T, N, D)")
+    print(f"Output shape: {output.shape} (B, T, V, D)")
     
     assert output.shape == (batch_size, num_frames, num_joints, d_model), "Incorrect output shape!"
     print("\nPHYSICAL EMBEDDING TEST PASSED!")

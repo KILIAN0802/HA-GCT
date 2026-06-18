@@ -1,3 +1,5 @@
+import os
+import numpy as np
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -51,6 +53,7 @@ def train_diffusion_model():
         
         # Save checkpoint
         if (epoch + 1) % 10 == 0:
+            os.makedirs('checkpoints', exist_ok=True)
             torch.save(model.state_dict(), f'checkpoints/skeleton_diffusion_epoch_{epoch+1}.pth')
     
     # Generate new data
@@ -61,6 +64,7 @@ def train_diffusion_model():
         
     # Save generated data
     new_samples_np = new_samples.cpu().numpy()
+    os.makedirs('data/400VSL/processed/27_direct', exist_ok=True)
     np.save('data/400VSL/processed/27_direct/generated_data.npy', new_samples_np)
     print(f"Saved 100 generated sequences to generated_data.npy")
 

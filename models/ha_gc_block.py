@@ -3,6 +3,7 @@ sys.path.extend(['./', '../'])
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import math
 
@@ -17,6 +18,11 @@ def drop_path(x, drop_prob=0.0, training=False):
     random_tensor = torch.rand(shape, dtype=x.dtype, device=x.device)
     random_tensor = torch.floor(random_tensor + keep_prob)
     return x / keep_prob * random_tensor
+
+def masked_row_normalize(A, mask, eps=1e-6):
+    A = A.masked_fill(mask == 0, 0.0)
+    row_sum = A.sum(dim=-1, keepdim=True).clamp_min(eps)
+    return A / row_sum
 
 class DropPath(nn.Module):
     def __init__(self, drop_prob=0.0):
@@ -101,16 +107,23 @@ class HA_GC_Block(nn.Module):
         A_hands = self.A_hands
         PA_hands = self.PA_hands
         
-        # Dynamically refine graph with learnable alpha/beta and hand weights
-        A = A + self.PA + A_hands * self.alpha + PA_hands * self.beta
+        A_base_raw = torch.relu(self.A + self.PA)
+        A_base_mask = (self.A > 0).float()
+        A_base = masked_row_normalize(A_base_raw, A_base_mask)
+        
+        A_hand_raw = torch.relu(self.A_hands * self.alpha + self.PA_hands * self.beta)
+        A_hand_mask = (self.A_hands > 0).float()
+        A_hand = masked_row_normalize(A_hand_raw, A_hand_mask)
+        
+        A = A_base + A_hand
+        A = A / A.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         
         y = None
         for i in range(self.num_subset):
             f = self.conv[i](x)  # (B, C_out, T, V)
             
-            # Matrix multiplication over spatial dimension
-            # Reshape for multiplication: (B, C*T, V) x (V, V) -> (B, C*T, V)
-            z = torch.matmul(f.view(B, -1, V), A[i]).view(B, -1, T, V)
+            # Matrix multiplication strictly over spatial dimension (V) using einsum
+            z = torch.einsum('bctv,vw->bctw', f, A[i])
             y = z + y if y is not None else z
             
         y = self.bn(y)

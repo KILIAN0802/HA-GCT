@@ -7,8 +7,6 @@ import torch.nn as nn
 from models.physical_embedding import PhysicalEmbedding
 from models.ha_gc_block import HA_GC_Block
 from models.mhsa import MHSAEncoderLayer
-from models.adaptive_graph import AdaptiveGraphRefinement
-from models.cross_attention import CrossAttentionFusion
 from models.classification_head import SimpleClassificationHead
 
 class HA_GCT(nn.Module):
@@ -71,11 +69,50 @@ class HA_GCT(nn.Module):
             for i in range(num_mhsa_layers)
         ])
         
-        self.temporal_proj = nn.Linear(d_model, d_model)
+        self.local_temporal_conv = nn.Conv1d(
+            in_channels=d_model,
+            out_channels=d_model,
+            kernel_size=3,
+            padding=1,
+            groups=d_model
+        )
+        self.local_temporal_norm = nn.LayerNorm(d_model)
+        
+        self.temporal_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model)
+        )
+        
+        # Lightweight spatial-temporal aggregation before pooling
+        self.spatial_temporal_conv = nn.Sequential(
+            nn.Conv2d(
+                d_model,
+                d_model,
+                kernel_size=(3, 1),
+                padding=(1, 0),
+                groups=d_model
+            ),
+            nn.BatchNorm2d(d_model),
+            nn.GELU()
+        )
+        
+        # Learnable joint attention pooling
+        self.joint_pool_score = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),
+            nn.GELU(),
+            nn.Linear(d_model // 4, 1)
+        )
         
         # 4. CROSS-ATTENTION FUSION (REPLACED BY CROSS-GATING)
-        self.fusion = nn.Linear(2 * d_model, d_model)
-        self.fusion_norm = nn.LayerNorm(d_model)
+        self.fusion_norm = nn.LayerNorm(2 * d_model)
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+        self.post_fusion_norm = nn.LayerNorm(d_model)
         
         # 5. CLASSIFICATION HEAD (GAP + Softmax)
         self.classifier = SimpleClassificationHead(
@@ -85,60 +122,68 @@ class HA_GCT(nn.Module):
     
     def forward(self, x, return_embedding=False):
         """
-        Input: x shape (B, C, T, N) = (B, 2, 64, 27)
-        Output: (B, num_classes) or (B, N, D)
+        Input: x shape (B, C, T, V)
+        Output: (B, num_classes) or (B, V, D)
         """
-        B, C, T, N = x.shape
+        B, C, T, V = x.shape
         
-        # STEP 1: Physical Embedding
-        # Transpose (B, C, T, N) -> (B, T, N, C)
-        x_embed = x.permute(0, 2, 3, 1).contiguous()
-        x_embed = self.physical_embedding(x_embed)  # (B, T, N, D)
+        # STEP 1: Physical Embedding (takes (B, C, T, V) -> returns (B, T, V, D))
+        x_embed = self.physical_embedding(x)  # (B, T, V, D)
         
         # STEP 2: Spatial Branch (HA-GC x3)
-        # HA-GC expects shape (B, D, T, N)
-        x_spatial = x_embed.permute(0, 3, 1, 2).contiguous()  # (B, D, T, N)
+        # HA-GC expects shape (B, D, T, V)
+        x_spatial = x_embed.permute(0, 3, 1, 2).contiguous()  # (B, D, T, V)
         
         for ha_gc_block in self.spatial_branch:
             x_spatial = ha_gc_block(x_spatial)
         
-        # Pool over time: (B, D, T, N) -> (B, D, N)
-        x_spatial = x_spatial.mean(dim=2)
-        # Transpose: (B, D, N) -> (B, N, D)
+        # Lightweight spatial-temporal temporal aggregation
+        x_spatial = x_spatial + self.spatial_temporal_conv(x_spatial)
+        
+        # Pool over time: (B, D, T, V) -> (B, D, V)
+        x_spatial = 0.5 * (
+            x_spatial.mean(dim=2) +
+            x_spatial.max(dim=2)[0]
+        )
+        # Transpose: (B, D, V) -> (B, V, D)
         x_spatial = x_spatial.transpose(1, 2)
         
         # STEP 3: Temporal Branch (MHSA x2)
-        # Pool over joints to extract temporal features: (B, T, N, D) -> (B, T, D)
-        x_temporal = x_embed.max(dim=2)[0] + x_embed.mean(dim=2)  # (B, T, D)
+        # Learnable joint attention pooling: (B, T, V, D) -> (B, T, D)
+        joint_score = self.joint_pool_score(x_embed)          # (B, T, V, 1)
+        joint_weight = torch.softmax(joint_score, dim=2)      # (B, T, V, 1)
+        x_temporal = (x_embed * joint_weight).sum(dim=2)      # (B, T, D)
+        
+        # Local temporal modeling (Depthwise Conv1D)
+        x_conv = x_temporal.transpose(1, 2)
+        x_conv = self.local_temporal_conv(x_conv)
+        x_temporal = x_temporal + x_conv.transpose(1, 2)
+        x_temporal = self.local_temporal_norm(x_temporal)
+        
         x_temporal = self.temporal_proj(x_temporal)
         
-        # Compute Adaptive Graph Adjacency (Disabled)
-        A_final = None
-        
-        # MHSA with Graph-Augmented Attention
+        # MHSA Layer (simplified standard dot-product attention)
         for mhsa_layer in self.temporal_branch:
-            x_temporal, attn_weights = mhsa_layer(
-                x_temporal, 
-                graph_adjacency=A_final
-            )
+            x_temporal, attn_weights = mhsa_layer(x_temporal)
         
         # STEP 4: Fusion using cross-gating
         # Fusion between spatial (x_spatial) and temporal (x_temporal)
         x_temporal_mean = x_temporal.mean(dim=1, keepdim=True)  # (B, 1, D)
-        x_temporal_expanded = x_temporal_mean.expand(-1, x_spatial.size(1), -1)  # (B, N, D)
+        x_temporal_expanded = x_temporal_mean.expand(-1, x_spatial.size(1), -1)  # (B, V, D)
         
-        gate = torch.sigmoid(self.fusion(torch.cat([
+        gate_input = self.fusion_norm(torch.cat([
             x_spatial,
             x_temporal_expanded
-        ], dim=-1)))
+        ], dim=-1))
+        gate = torch.sigmoid(self.fusion_gate(gate_input))
         
         x_fused = gate * x_spatial + (1 - gate) * x_temporal_expanded
-        x_fused = self.fusion_norm(x_fused)
+        x_fused = self.post_fusion_norm(x_fused)
         
         if return_embedding:
             return x_fused
             
-        # STEP 5: Classification (GAP + Softmax)
+        # STEP 5: Classification (LayerNorm + mean + MLP)
         output = self.classifier(x_fused)  # (B, num_classes)
         
         return output

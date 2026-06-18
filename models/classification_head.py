@@ -153,24 +153,26 @@ class ClassificationHead(nn.Module):
 
 class SimpleClassificationHead(nn.Module):
     """
-    Simple Classification Head (không có hidden layer)
-    
-    Kiến trúc đơn giản:
-    1. GAP
-    2. FC -> num_classes
-    3. Softmax
-    
-    Dùng khi muốn model nhẹ hơn
+    Improved Classification Head with LayerNorm + Mean & Max Pooling + MLP
     """
     
-    def __init__(self, d_model=256, num_classes=400):
+    def __init__(self, d_model=256, num_classes=400, dropout=0.5):
         super().__init__()
-        self.gap = GlobalAveragePooling(dim=1)
-        self.fc = nn.Linear(d_model, num_classes)
+        self.norm = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, num_classes)
+        )
     
     def forward(self, x):
-        pooled = self.gap(x)  # (B, D)
-        logits = self.fc(pooled)  # (B, num_classes)
+        # x shape: (B, N, D)
+        x = self.norm(x)
+        x_mean = x.mean(dim=1)  # (B, D)
+        x_max = x.max(dim=1)[0]  # (B, D)
+        x_concat = torch.cat([x_mean, x_max], dim=-1)  # (B, 2 * D)
+        logits = self.mlp(x_concat)  # (B, num_classes)
         return logits
 
 

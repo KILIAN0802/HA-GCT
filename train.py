@@ -56,8 +56,8 @@ def parse_args():
     parser.add_argument('--crop-min-ratio', type=float, default=0.6, help='Crop min ratio for spatial augmentation')
     parser.add_argument('--d-model', type=int, default=128, help='d_model dimension')
     parser.add_argument('--model-type', type=str, default='multistream', choices=['multistream', 'earlyfusion'], help='Model architecture selection')
-    parser.add_argument('--mixup-alpha', type=float, default=0.0, help='Alpha parameter for Mixup augmentation (0.0 to disable)')
-    parser.add_argument('--warmup-epochs', type=int, default=1, help='Number of warmup epochs')
+    parser.add_argument('--mixup-alpha', type=float, default=0.1, help='Alpha parameter for Mixup augmentation (0.0 to disable)')
+    parser.add_argument('--warmup-epochs', type=int, default=5, help='Number of warmup epochs')
     parser.add_argument('--overfit-one-batch', action='store_true', help='Sanity check: train on a single batch for 500 steps to check convergence')
     
     return parser.parse_args()
@@ -141,29 +141,59 @@ class MaskedSkeletonAutoencoder(nn.Module):
         
     def forward(self, x, mask):
         B, C, T, N = x.shape
-        x_embed = x.permute(0, 2, 3, 1).contiguous()
-        x_embed = self.encoder.physical_embedding(x_embed)
         
-        mask_expanded = mask.unsqueeze(-1)
+        # STEP 1: Physical Embedding (takes (B, C, T, N) -> returns (B, T, N, D))
+        x_embed = self.encoder.physical_embedding(x)  # (B, T, N, D)
+        
+        # Mask the joint embeddings
+        mask_expanded = mask.unsqueeze(-1)  # (B, T, N, 1)
         x_embed = torch.where(mask_expanded, self.mask_token, x_embed)
         
-        x_spatial = x_embed.permute(0, 3, 1, 2).contiguous()
+        # STEP 2: Spatial Branch (HA-GC x3)
+        # HA-GC expects shape (B, D, T, N)
+        x_spatial = x_embed.permute(0, 3, 1, 2).contiguous()  # (B, D, T, N)
         for ha_gc_block in self.encoder.spatial_branch:
             x_spatial = ha_gc_block(x_spatial)
-        x_spatial = x_spatial.mean(dim=2)
-        x_spatial = x_spatial.transpose(1, 2)
+        x_spatial = x_spatial + self.encoder.spatial_temporal_conv(x_spatial)
+        x_spatial = 0.5 * (x_spatial.mean(dim=2) + x_spatial.max(dim=2)[0])
+        x_spatial = x_spatial.transpose(1, 2)  # (B, N, D)
         
-        x_temporal = x_embed.mean(dim=2)
-        A_final = self.encoder.adaptive_graph(x_temporal)
+        # STEP 3: Temporal Branch (MHSA x2)
+        # Learnable joint attention pooling
+        joint_score = self.encoder.joint_pool_score(x_embed)          # (B, T, N, 1)
+        joint_weight = torch.softmax(joint_score, dim=2)              # (B, T, N, 1)
+        x_temporal = (x_embed * joint_weight).sum(dim=2)              # (B, T, D)
+        
+        # Local temporal modeling (Depthwise Conv1D)
+        x_conv = x_temporal.transpose(1, 2)
+        x_conv = self.encoder.local_temporal_conv(x_conv)
+        x_temporal = x_temporal + x_conv.transpose(1, 2)
+        x_temporal = self.encoder.local_temporal_norm(x_temporal)
+        
+        x_temporal = self.encoder.temporal_proj(x_temporal)
+        
+        # MHSA Layer (standard dot-product attention)
         for mhsa_layer in self.encoder.temporal_branch:
-            x_temporal, attn_weights = mhsa_layer(x_temporal, graph_adjacency=A_final)
+            x_temporal, attn_weights = mhsa_layer(x_temporal)
             
-        x_fused = self.encoder.cross_fusion(x_spatial, x_temporal)
+        # STEP 4: Gated Fusion & LayerNorm
+        x_temporal_mean = x_temporal.mean(dim=1, keepdim=True)  # (B, 1, D)
+        x_temporal_expanded = x_temporal_mean.expand(-1, x_spatial.size(1), -1)  # (B, N, D)
         
-        out = self.decoder(x_fused)
+        gate_input = self.encoder.fusion_norm(torch.cat([
+            x_spatial,
+            x_temporal_expanded
+        ], dim=-1))
+        gate = torch.sigmoid(self.encoder.fusion_gate(gate_input))
+        
+        x_fused = gate * x_spatial + (1 - gate) * x_temporal_expanded
+        x_fused = self.encoder.post_fusion_norm(x_fused)  # (B, N, D)
+        
+        # STEP 5: Decode to coordinates
+        out = self.decoder(x_fused)  # (B, N, T_max * C)
         out = out.view(B, N, self.max_frames, self.in_channels)
         out = out[:, :, :T, :]
-        out = out.permute(0, 2, 1, 3).contiguous()
+        out = out.permute(0, 2, 1, 3).contiguous()  # (B, T, N, C)
         
         return out
 
@@ -223,13 +253,26 @@ def load_pretrained_encoder(model, pretrained_path, device):
     
     for stream_name in ['stream_joint', 'stream_bone', 'stream_velocity']:
         mapped_dict = {}
+        skipped = []
         for k, v in pretrained_dict.items():
             mapped_key = f"{stream_name}.{k}"
-            if mapped_key in model_dict:
+            if mapped_key in model_dict and model_dict[mapped_key].shape == v.shape:
                 mapped_dict[mapped_key] = v
+            else:
+                skipped.append((
+                    mapped_key,
+                    tuple(v.shape),
+                    tuple(model_dict[mapped_key].shape) if mapped_key in model_dict else None
+                ))
                 
-        model.load_state_dict(mapped_dict, strict=False)
-        print(f"  Initialized {stream_name} with pre-trained encoder weights.")
+        if mapped_dict:
+            model.load_state_dict(mapped_dict, strict=False)
+            print(f"  Initialized {stream_name} with {len(mapped_dict)} matched tensors.")
+        else:
+            print(f"  Skipped {stream_name}: no compatible pretrained tensors.")
+            
+        if skipped and len(mapped_dict) > 0:
+            print(f"  Skipped {len(skipped)} incompatible/missing tensors for {stream_name}.")
 
 def get_dataset_labels(dataset):
     if isinstance(dataset, torch.utils.data.Subset):
