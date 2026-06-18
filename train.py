@@ -25,7 +25,7 @@ from models.ha_gct import HA_GCT, MultiStreamHA_GCT
 def parse_args():
     parser = argparse.ArgumentParser(description="HA-GCT Training Pipeline")
     parser.add_argument('--data-dir', type=str, default='data/400VSL/processed/27_direct', help='Path to dataset directory')
-    parser.add_argument('--epochs', type=int, default=200, help='Number of epochs to train')
+    parser.add_argument('--epochs', type=int, default=500, help='Number of epochs to train')
     parser.add_argument('--batch-size', type=int, default=16, help='Batch size')
     parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
     parser.add_argument('--weight-decay', type=float, default=0.05, help='Weight decay')
@@ -38,8 +38,9 @@ def parse_args():
     parser.add_argument('--log-dir', type=str, default='results/logs', help='Directory for TensorBoard logs')
     
     # wandb & dataset options
-    parser.add_argument('--use-wandb', action='store_true', default=True, help='Use Weights & Biases for logging')
+    parser.add_argument('--no-wandb', action='store_true', help='Disable Weights & Biases logging')
     parser.add_argument('--wandb-project', type=str, default='HA-GCT', help='Weights & Biases project name')
+    parser.add_argument('--wandb-entity', type=str, default='', help='Weights & Biases entity (username or team)')
     parser.add_argument('--dataset', type=str, default='vsl400', choices=['vsl400', 'multivsl200'], help='Dataset selection')
     parser.add_argument('--split-method', type=str, default='random', choices=['random', 'signer'], help='MultiVSL200 dataset split method')
     parser.add_argument('--resume', type=str, default='', help='Path to checkpoint to resume training from')
@@ -528,10 +529,21 @@ def main():
         print(f"Auto-configured num_classes to 199 for MultiVSL200 dataset.")
         
     # Initialize wandb if requested and available
-    use_wandb = args.use_wandb and WANDB_AVAILABLE
+    use_wandb = (not args.no_wandb) and WANDB_AVAILABLE
+    
+    if not args.no_wandb and not WANDB_AVAILABLE:
+        print("=" * 70)
+        print("WARNING: Weights & Biases (wandb) is not installed or import failed.")
+        print("         Logs will NOT be sent to wandb.")
+        print("         To resolve this, please run:")
+        print("             pip install wandb")
+        print("         And ensure you are logged in using 'wandb login'.")
+        print("=" * 70)
+        
     if use_wandb:
         wandb.init(
             project=args.wandb_project,
+            entity=args.wandb_entity if args.wandb_entity else None,
             config=vars(args),
             name=f"ha_gct_{args.dataset}_{run_id}",
             id=run_id,
