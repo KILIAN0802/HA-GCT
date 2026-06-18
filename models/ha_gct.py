@@ -33,7 +33,7 @@ class HA_GCT(nn.Module):
         nhead=4,
         num_classes=400,         # 400VSL dataset
         dropout=0.1,
-        graph_lambda=0.1,        # lambda in MHSA formula
+        graph_lambda=0.05,        # lambda in MHSA formula
         max_frames=100
     ):
         super().__init__()
@@ -71,8 +71,11 @@ class HA_GCT(nn.Module):
             for i in range(num_mhsa_layers)
         ])
         
-        # 4. CROSS-ATTENTION FUSION (REPLACED BY SIMPLE ADD + LINEAR PROJECTION)
-        self.fusion = nn.Linear(d_model, d_model)
+        self.temporal_proj = nn.Linear(d_model, d_model)
+        
+        # 4. CROSS-ATTENTION FUSION (REPLACED BY CROSS-GATING)
+        self.fusion = nn.Linear(2 * d_model, d_model)
+        self.fusion_norm = nn.LayerNorm(d_model)
         
         # 5. CLASSIFICATION HEAD (GAP + Softmax)
         self.classifier = SimpleClassificationHead(
@@ -106,7 +109,8 @@ class HA_GCT(nn.Module):
         
         # STEP 3: Temporal Branch (MHSA x2)
         # Pool over joints to extract temporal features: (B, T, N, D) -> (B, T, D)
-        x_temporal = x_embed.mean(dim=2)  # (B, T, D)
+        x_temporal = x_embed.max(dim=2)[0] + x_embed.mean(dim=2)  # (B, T, D)
+        x_temporal = self.temporal_proj(x_temporal)
         
         # Compute Adaptive Graph Adjacency (Disabled)
         A_final = None
@@ -118,10 +122,18 @@ class HA_GCT(nn.Module):
                 graph_adjacency=A_final
             )
         
-        # STEP 4: Simple Fusion (Addition + Linear projection)
+        # STEP 4: Fusion using cross-gating
         # Fusion between spatial (x_spatial) and temporal (x_temporal)
-        x_fused = x_spatial + x_temporal.mean(dim=1, keepdim=True)
-        x_fused = self.fusion(x_fused)  # (B, N, D)
+        x_temporal_mean = x_temporal.mean(dim=1, keepdim=True)  # (B, 1, D)
+        x_temporal_expanded = x_temporal_mean.expand(-1, x_spatial.size(1), -1)  # (B, N, D)
+        
+        gate = torch.sigmoid(self.fusion(torch.cat([
+            x_spatial,
+            x_temporal_expanded
+        ], dim=-1)))
+        
+        x_fused = gate * x_spatial + (1 - gate) * x_temporal_expanded
+        x_fused = self.fusion_norm(x_fused)
         
         if return_embedding:
             return x_fused
@@ -145,7 +157,7 @@ class MultiStreamHA_GCT(nn.Module):
         nhead=4,
         num_classes=400,
         dropout=0.5,
-        graph_lambda=0.1,
+        graph_lambda=0.05,
         max_frames=100
     ):
         super().__init__()
@@ -182,7 +194,7 @@ class EarlyFusionHA_GCT(nn.Module):
         nhead=4,
         num_classes=400,
         dropout=0.5,
-        graph_lambda=0.1,
+        graph_lambda=0.05,
         max_frames=100
     ):
         super().__init__()

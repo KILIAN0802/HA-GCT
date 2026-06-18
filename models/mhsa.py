@@ -87,7 +87,7 @@ class MHSA_Block(nn.Module):
         num_joints=27,
         d_ff=512,
         dropout=0.1,
-        graph_lambda=0.1,
+        graph_lambda=0.05,
         num_layers=2
     ):
         super().__init__()
@@ -160,7 +160,7 @@ class MHSAEncoderLayer(nn.Module):
         num_joints=27,
         d_ff=512,
         dropout=0.1,
-        graph_lambda=0.1,
+        graph_lambda=0.05,
         drop_path_prob=0.0
     ):
         super().__init__()
@@ -229,7 +229,7 @@ class GraphAugmentedAttention(nn.Module):
         nhead=4,
         num_joints=27,
         dropout=0.1,
-        graph_lambda=0.1
+        graph_lambda=0.05
     ):
         super().__init__()
         

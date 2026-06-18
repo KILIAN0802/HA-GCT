@@ -646,7 +646,7 @@ def main():
             nhead=4,
             num_classes=args.num_classes,
             dropout=0.5,
-            graph_lambda=0.1,
+            graph_lambda=0.05,
             max_frames=max_frames
         ).to(device)
     else:
@@ -659,7 +659,7 @@ def main():
             nhead=4,
             num_classes=args.num_classes,
             dropout=0.5,
-            graph_lambda=0.1,
+            graph_lambda=0.05,
             max_frames=max_frames
         ).to(device)
     
