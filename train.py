@@ -58,6 +58,7 @@ def parse_args():
     parser.add_argument('--model-type', type=str, default='multistream', choices=['multistream', 'earlyfusion'], help='Model architecture selection')
     parser.add_argument('--mixup-alpha', type=float, default=0.0, help='Alpha parameter for Mixup augmentation (0.0 to disable)')
     parser.add_argument('--warmup-epochs', type=int, default=3, help='Number of warmup epochs')
+    parser.add_argument('--overfit-one-batch', action='store_true', help='Sanity check: train on a single batch for 500 steps to check convergence')
     
     return parser.parse_args()
 
@@ -765,6 +766,40 @@ def main():
     os.makedirs(run_log_dir, exist_ok=True)
     writer = SummaryWriter(run_log_dir)
     
+    # =========================================================================
+    # SANITY CHECK: Overfit One Batch
+    # =========================================================================
+    if args.overfit_one_batch:
+        print("\n" + "=" * 70)
+        print("SANITY CHECK: OVERFIT ONE BATCH TEST")
+        print("=" * 70)
+        
+        # Get one single batch from train_loader
+        batch_data, batch_labels = next(iter(train_loader))
+        batch_data = batch_data.to(device)
+        batch_labels = batch_labels.to(device)
+        
+        print(f"Batch shape: {batch_data.shape}")
+        print(f"Labels: {batch_labels.cpu().tolist()}")
+        print("Training on this single batch for 500 steps...")
+        
+        model.train()
+        for step in range(500):
+            optimizer.zero_grad()
+            outputs = model(batch_data)
+            loss = criterion(outputs, batch_labels)
+            loss.backward()
+            optimizer.step()
+            
+            if (step + 1) % 25 == 0 or step == 0:
+                top1_c, _ = topk_accuracy_count(outputs, batch_labels)
+                acc = 100.0 * top1_c / batch_data.size(0)
+                print(f"Step {step+1:03d}/500 - Loss: {loss.item():.6f} - Acc: {acc:.2f}%")
+                
+        print("Overfit test completed!")
+        print("=" * 70 + "\n")
+        return
+        
     print("\nStarting training loops...")
     for epoch in range(start_epoch, args.epochs):
         train_loss, train_acc_top1, train_acc_top5 = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch, scaler, mixup_alpha=args.mixup_alpha)
