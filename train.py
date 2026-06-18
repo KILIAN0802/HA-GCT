@@ -781,7 +781,11 @@ def main():
         
         print(f"Batch shape: {batch_data.shape}")
         print(f"Labels: {batch_labels.cpu().tolist()}")
-        print("Training on this single batch for 500 steps...")
+        
+        # Re-initialize a simple optimizer with a healthy learning rate for overfitting
+        overfit_lr = 1e-3
+        optimizer = optim.AdamW(model.parameters(), lr=overfit_lr)
+        print(f"Training on this single batch for 500 steps with AdamW (lr={overfit_lr})...")
         
         model.train()
         for step in range(500):
