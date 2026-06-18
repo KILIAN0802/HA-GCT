@@ -36,7 +36,8 @@ for SEED in "${SEEDS[@]}"; do
         --model-type earlyfusion \
         --d-model 256 \
         --epochs 500 \
-        --batch-size 32 \
+        --batch-size 16 \
+        --accum-steps 8 \
         --lr 7e-4 \
         --mixup-alpha 0.05 \
         --warmup-epochs 5 \

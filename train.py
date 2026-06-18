@@ -65,6 +65,7 @@ def parse_args():
     parser.add_argument('--classifier-lr-mult', type=float, default=2.0, help='Classifier LR multiplier')
     parser.add_argument('--drop-path-max', type=float, default=0.0, help='Maximum DropPath probability')
     parser.add_argument('--warmup-epochs', type=int, default=5, help='Number of warmup epochs')
+    parser.add_argument('--accum-steps', type=int, default=4, help='Gradient accumulation steps')
     parser.add_argument('--overfit-one-batch', action='store_true', help='Sanity check: train on a single batch for 500 steps to check convergence')
     
     return parser.parse_args()
@@ -326,7 +327,7 @@ def topk_accuracy_count(output, target, topk=(1, 5)):
                 res.append(correct_k)
         return res
 
-def train_epoch(model, loader, criterion, optimizer, scheduler, device, epoch, scaler=None, mixup_alpha=0.0):
+def train_epoch(model, loader, criterion, optimizer, scheduler, device, epoch, scaler=None, mixup_alpha=0.0, accum_steps=4):
     model.train()
     total_loss = 0.0
     correct_top1 = 0
@@ -336,7 +337,7 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, device, epoch, s
     use_amp = (device.type == 'cuda' and scaler is not None)
     
     # Thiết lập tham số Mixup
-    ACCUM_STEPS = 4  # Tích lũy gradient qua 4 bước
+    ACCUM_STEPS = accum_steps  # Tích lũy gradient
     
     optimizer.zero_grad()
     progress_bar = tqdm(loader, desc=f"Epoch {epoch+1} [Train]")
@@ -771,7 +772,7 @@ def main():
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
     # Sequential learning rate scheduler with Linear Warm-up & Cosine Annealing Warm Restarts (Step-based)
-    ACCUM_STEPS = 4
+    ACCUM_STEPS = args.accum_steps
     steps_per_epoch = max(1, (len(train_loader) + ACCUM_STEPS - 1) // ACCUM_STEPS)
     
     warmup_epochs = args.warmup_epochs
@@ -880,7 +881,7 @@ def main():
         
     print("\nStarting training loops...")
     for epoch in range(start_epoch, args.epochs):
-        train_loss, train_acc_top1, train_acc_top5 = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch, scaler, mixup_alpha=args.mixup_alpha)
+        train_loss, train_acc_top1, train_acc_top5 = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch, scaler, mixup_alpha=args.mixup_alpha, accum_steps=args.accum_steps)
         val_loss, val_acc_top1, val_acc_top5 = eval_model(model, val_loader, criterion, device, desc=f"Epoch {epoch+1} [Val]", use_tta=args.tta)
         
         # Log to tensorboard
