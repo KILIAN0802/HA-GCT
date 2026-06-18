@@ -57,6 +57,7 @@ def parse_args():
     parser.add_argument('--d-model', type=int, default=128, help='d_model dimension')
     parser.add_argument('--model-type', type=str, default='multistream', choices=['multistream', 'earlyfusion'], help='Model architecture selection')
     parser.add_argument('--mixup-alpha', type=float, default=0.0, help='Alpha parameter for Mixup augmentation (0.0 to disable)')
+    parser.add_argument('--warmup-epochs', type=int, default=3, help='Number of warmup epochs')
     
     return parser.parse_args()
 
@@ -698,9 +699,9 @@ def main():
     ACCUM_STEPS = 4
     steps_per_epoch = max(1, (len(train_loader) + ACCUM_STEPS - 1) // ACCUM_STEPS)
     
-    warmup_epochs = 15
+    warmup_epochs = args.warmup_epochs
     if args.dummy_test:
-        warmup_epochs = 2
+        warmup_epochs = min(2, args.warmup_epochs)
         
     warmup_steps = warmup_epochs * steps_per_epoch
     

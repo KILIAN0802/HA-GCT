@@ -242,13 +242,11 @@ class SpatialAugmentation:
         start_idx = random.randint(0, T - crop_len)
         cropped_sample = sample[:, start_idx:start_idx+crop_len, :]
         
-        # Interpolate back to original length T
-        new_sample = np.zeros((C, T, V), dtype=sample.dtype)
-        x_old = np.linspace(0, 1, crop_len)
-        x_new = np.linspace(0, 1, T)
-        for c in range(C):
-            for v in range(V):
-                new_sample[c, :, v] = np.interp(x_new, x_old, cropped_sample[c, :, v])
+        # Interpolate back to original length T using vectorized PyTorch F.interpolate
+        cropped_tensor = torch.from_numpy(cropped_sample).float()  # (C, crop_len, V)
+        cropped_tensor = cropped_tensor.permute(0, 2, 1).reshape(1, C * V, crop_len)
+        new_tensor = F.interpolate(cropped_tensor, size=T, mode='linear', align_corners=False)  # (1, C * V, T)
+        new_sample = new_tensor.view(C, V, T).permute(0, 2, 1).numpy()
         return new_sample
 
     def _apply_random_rotation(self, skeleton):
