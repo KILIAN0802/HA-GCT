@@ -39,27 +39,42 @@ class VSLDataset(Dataset):
         else:
             self.augmentor = None
         
+        # Pre-apply transform (deterministic preprocessing) to the entire dataset to optimize speed
+        if self.transform is not None:
+            print(f"Pre-applying transform to the entire VSLDataset ({'Train' if is_train else 'Val/Test'})...")
+            preprocessed_data = []
+            for i in range(len(self.data)):
+                preprocessed_data.append(self.transform(self.data[i]))
+            # Stack into a tensor
+            self.data = torch.stack(preprocessed_data)
+            self.transform = None  # Clear transform so it isn't applied twice
+        
         print(f"Loaded {len(self.data)} samples ({'Train' if is_train else 'Test'})")
     
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
-        sample = self.data[idx]  # (C, T, V)
+        sample = self.data[idx]  # (C, T, V) or preprocessed tensor
         label = self.labels[idx]
         
         # Apply Spatial Augmentation (chỉ khi train)
         if self.is_train and self.augmentor is not None:
-            sample = self.augmentor(sample)
+            if isinstance(sample, torch.Tensor):
+                sample_np = sample.numpy()
+            else:
+                sample_np = sample
+            sample_np = self.augmentor(sample_np)
+            sample = torch.from_numpy(sample_np).float()
         
         # Apply other transforms (One Euro Filter, Normalization...)
         if self.transform:
             sample = self.transform(sample)
         
         if isinstance(sample, torch.Tensor):
-            return sample.float(), torch.LongTensor([label]).squeeze()
+            return sample.float(), torch.tensor(label, dtype=torch.long)
         else:
-            return torch.FloatTensor(sample), torch.LongTensor([label]).squeeze() #squeeze dùng để bỏ chiều dư thừa
+            return torch.FloatTensor(sample), torch.tensor(label, dtype=torch.long)
 
 
 def get_dataloaders(data_dir, batch_size=32, num_workers=4, transform=None, crop_min_ratio=0.6):
@@ -85,7 +100,7 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, transform=None, crop
 
 class MultiVSL200Dataset(Dataset):
     """Dataset for MultiVSL200 loading individual npy files"""
-    def __init__(self, data_dir, transform=None, signer_ids=None, is_train=True, crop_min_ratio=0.6):
+    def __init__(self, data_dir, transform=None, signer_ids=None, is_train=True, crop_min_ratio=0.6, files=None):
         self.data_dir = data_dir
         self.transform = transform
         self.is_train = is_train
@@ -98,18 +113,21 @@ class MultiVSL200Dataset(Dataset):
         word_ids = sorted(list(set([int(f.split('_')[-1].replace('.npy', '')) for f in all_files])))
         self.word_to_label = {wid: idx for idx, wid in enumerate(word_ids)}
         
-        self.files = []
-        for f in all_files:
-            signer_id = f.split('_')[0]
-            word_id = int(f.split('_')[-1].replace('.npy', ''))
-            label = self.word_to_label[word_id]
-            
-            # Filter by signer IDs if provided (useful for Cross-Signer validation/splits)
-            if signer_ids is not None:
-                if signer_id in signer_ids:
+        if files is not None:
+            self.files = files
+        else:
+            self.files = []
+            for f in all_files:
+                signer_id = f.split('_')[0]
+                word_id = int(f.split('_')[-1].replace('.npy', ''))
+                label = self.word_to_label[word_id]
+                
+                # Filter by signer IDs if provided (useful for Cross-Signer validation/splits)
+                if signer_ids is not None:
+                    if signer_id in signer_ids:
+                        self.files.append((f, label))
+                else:
                     self.files.append((f, label))
-            else:
-                self.files.append((f, label))
                 
         # Initialize Augmentation (chỉ áp dụng khi train)
         if is_train:
@@ -128,28 +146,43 @@ class MultiVSL200Dataset(Dataset):
         else:
             self.augmentor = None
             
-        print(f"Loaded {len(self.files)} samples from {data_dir} ({'Train' if is_train else 'Val/Test'})")
+        print(f"Preloading and preprocessing {len(self.files)} samples from {data_dir} ({'Train' if is_train else 'Val/Test'})...")
+        self.samples = []
+        self.labels = []
+        for f, label in self.files:
+            file_path = os.path.join(self.data_dir, f)
+            sample = np.load(file_path)
+            
+            # Pre-apply transform (interpolation, One Euro Filter, normalizations)
+            if self.transform is not None:
+                sample = self.transform(sample)
+                
+            if isinstance(sample, torch.Tensor):
+                sample = sample.numpy()
+                
+            self.samples.append(sample)
+            self.labels.append(label)
+            
+        # Clear transform since we pre-applied it
+        self.transform = None
+        print(f"Loaded and preprocessed {len(self.samples)} samples.")
         
     def __len__(self):
-        return len(self.files)
+        return len(self.samples)
         
     def __getitem__(self, idx):
-        filename, label = self.files[idx]
-        file_path = os.path.join(self.data_dir, filename)
-        
-        # Load sample coordinates shape: (150, 27, 3)
-        sample = np.load(file_path)
+        sample = self.samples[idx]  # Preprocessed tensor of shape (2, max_frames, 27)
+        label = self.labels[idx]
         
         # Apply Spatial Augmentation (chỉ khi train)
         if self.is_train and self.augmentor is not None:
-            # SpatialAugmentation expects (C, T, V) but loaded sample is (T, V, C)
-            sample = sample.transpose(2, 0, 1)
-            sample = self.augmentor(sample)
-            sample = sample.transpose(1, 2, 0)
-            
-        # Apply transform (One Euro Filter + Smart Interpolation + reshape to (2, max_frames, 27))
-        if self.transform:
-            sample = self.transform(sample)
+            # SpatialAugmentation expects numpy array of shape (C, T, V)
+            if isinstance(sample, torch.Tensor):
+                sample_np = sample.numpy()
+            else:
+                sample_np = sample
+            sample_np = self.augmentor(sample_np)
+            sample = torch.from_numpy(sample_np).float()
             
         if isinstance(sample, torch.Tensor):
             return sample.float(), torch.tensor(label, dtype=torch.long)
@@ -170,18 +203,31 @@ def get_multivsl_loaders(data_dir, batch_size=32, num_workers=4, transform=None,
         test_dataset = MultiVSL200Dataset(data_dir, transform=transform, signer_ids=test_signers, is_train=False)
     else:
         # Random split (80% train, 10% val, 10% test)
-        full_dataset = MultiVSL200Dataset(data_dir, transform=transform, crop_min_ratio=crop_min_ratio)
-        total_len = len(full_dataset)
+        all_files = sorted([f for f in os.listdir(data_dir) if f.endswith('.npy')])
+        word_ids = sorted(list(set([int(f.split('_')[-1].replace('.npy', '')) for f in all_files])))
+        word_to_label = {wid: idx for idx, wid in enumerate(word_ids)}
+        
+        files_with_labels = []
+        for f in all_files:
+            word_id = int(f.split('_')[-1].replace('.npy', ''))
+            label = word_to_label[word_id]
+            files_with_labels.append((f, label))
+            
+        import random
+        rng = random.Random(42)
+        rng.shuffle(files_with_labels)
+        
+        total_len = len(files_with_labels)
         train_len = int(0.8 * total_len)
         val_len = int(0.1 * total_len)
-        test_len = total_len - train_len - val_len
         
-        # Use random_split from torch
-        from torch.utils.data import random_split
-        train_dataset, val_dataset, test_dataset = random_split(
-            full_dataset, [train_len, val_len, test_len],
-            generator=torch.Generator().manual_seed(42)
-        )
+        train_files = files_with_labels[:train_len]
+        val_files = files_with_labels[train_len:train_len+val_len]
+        test_files = files_with_labels[train_len+val_len:]
+        
+        train_dataset = MultiVSL200Dataset(data_dir, transform=transform, is_train=True, crop_min_ratio=crop_min_ratio, files=train_files)
+        val_dataset = MultiVSL200Dataset(data_dir, transform=transform, is_train=False, files=val_files)
+        test_dataset = MultiVSL200Dataset(data_dir, transform=transform, is_train=False, files=test_files)
         
     dataloader_kwargs = {
         'batch_size': batch_size,
