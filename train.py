@@ -928,12 +928,12 @@ def main():
             print(f"New best model saved with Val Acc (Top-1): {best_acc*100:.2f}%")
             if use_wandb:
                 wandb.save(best_path)
-        else:
-            patience_counter += 1
-            print(f"Early Stopping Counter: {patience_counter}/{args.patience}")
-            if patience_counter >= args.patience:
-                print(f"Early stopping triggered! Training stopped after {epoch+1} epochs because Val Acc (Top-1) did not improve for {args.patience} epochs.")
-                break
+        # else:
+        #     patience_counter += 1
+        #     print(f"Early Stopping Counter: {patience_counter}/{args.patience}")
+        #     if patience_counter >= args.patience:
+        #         print(f"Early stopping triggered! Training stopped after {epoch+1} epochs because Val Acc (Top-1) did not improve for {args.patience} epochs.")
+        #         break
             
         # Periodic save (save full training state for resume capability)
         if (epoch + 1) % 10 == 0:
