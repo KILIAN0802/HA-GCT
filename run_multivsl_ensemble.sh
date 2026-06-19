@@ -35,7 +35,8 @@ for SEED in "${SEEDS[@]}"; do
         --seed "$SEED" \
         --model-type earlyfusion \
         --d-model 256 \
-        --epochs 500 \
+        --epochs 1000 \
+        --patience 50 \
         --batch-size 16 \
         --accum-steps 8 \
         --lr 7e-4 \
@@ -45,6 +46,7 @@ for SEED in "${SEEDS[@]}"; do
         --label-smoothing 0.05 \
         --save-dir "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/" \
         > "logs/${ENSEMBLE_RUN_ID}/seed_${SEED}.log" 2>&1
+        
 
     echo "Finished training for Seed $SEED at $(date)"
 

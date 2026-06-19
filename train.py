@@ -26,6 +26,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="HA-GCT Training Pipeline")
     parser.add_argument('--data-dir', type=str, default='data/400VSL/processed/27_direct', help='Path to dataset directory')
     parser.add_argument('--epochs', type=int, default=500, help='Number of epochs to train')
+    parser.add_argument('--patience', type=int, default=50, help='Patience for early stopping (number of epochs with no improvement)')
     parser.add_argument('--batch-size', type=int, default=16, help='Batch size')
     parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
     parser.add_argument('--weight-decay', type=float, default=0.05, help='Weight decay')
@@ -802,6 +803,7 @@ def main():
     
     start_epoch = 0
     best_acc = -1.0
+    patience_counter = 0
     
     if is_resume:
         print(f"Loading checkpoint from: {args.resume}")
@@ -823,6 +825,9 @@ def main():
             if 'best_acc' in checkpoint:
                 best_acc = checkpoint['best_acc']
                 print(f"Restored best validation accuracy: {best_acc * 100:.2f}%")
+            if 'patience_counter' in checkpoint:
+                patience_counter = checkpoint['patience_counter']
+                print(f"Restored patience counter: {patience_counter}")
         else:
             model.load_state_dict(checkpoint)
             filename = os.path.basename(args.resume)
@@ -910,6 +915,7 @@ def main():
         # Save best model based on Top-1
         if val_acc_top1 > best_acc:
             best_acc = val_acc_top1
+            patience_counter = 0
             best_path = os.path.join(run_save_dir, 'best_ha_gct_model.pth')
             torch.save({
                 'epoch': epoch,
@@ -917,10 +923,17 @@ def main():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'best_acc': best_acc,
+                'patience_counter': patience_counter,
             }, best_path)
             print(f"New best model saved with Val Acc (Top-1): {best_acc*100:.2f}%")
             if use_wandb:
                 wandb.save(best_path)
+        else:
+            patience_counter += 1
+            print(f"Early Stopping Counter: {patience_counter}/{args.patience}")
+            if patience_counter >= args.patience:
+                print(f"Early stopping triggered! Training stopped after {epoch+1} epochs because Val Acc (Top-1) did not improve for {args.patience} epochs.")
+                break
             
         # Periodic save (save full training state for resume capability)
         if (epoch + 1) % 10 == 0:
@@ -931,6 +944,7 @@ def main():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'best_acc': best_acc,
+                'patience_counter': patience_counter,
             }, periodic_path)
             print(f"Periodic checkpoint saved: {periodic_path}")
             if use_wandb:
