@@ -43,10 +43,19 @@ class VSLDataset(Dataset):
         if self.transform is not None:
             print(f"Pre-applying transform to the entire VSLDataset ({'Train' if is_train else 'Val/Test'})...")
             preprocessed_data = []
+            valid_lengths = []
             for i in range(len(self.data)):
-                preprocessed_data.append(self.transform(self.data[i]))
+                res = self.transform(self.data[i])
+                if isinstance(res, tuple):
+                    coords_t, val_len = res
+                else:
+                    coords_t = res
+                    val_len = coords_t.shape[1]
+                preprocessed_data.append(coords_t)
+                valid_lengths.append(val_len)
             # Stack into a tensor
             self.data = torch.stack(preprocessed_data)
+            self.valid_lengths = torch.tensor(valid_lengths, dtype=torch.long)
             self.transform = None  # Clear transform so it isn't applied twice
         
         print(f"Loaded {len(self.data)} samples ({'Train' if is_train else 'Test'})")
@@ -68,13 +77,28 @@ class VSLDataset(Dataset):
             sample = torch.from_numpy(sample_np).float()
         
         # Apply other transforms (One Euro Filter, Normalization...)
+        valid_length = sample.shape[1] if isinstance(sample, torch.Tensor) else sample.shape[1] # fallback
         if self.transform:
-            sample = self.transform(sample)
+            res = self.transform(sample)
+            if isinstance(res, tuple):
+                sample, valid_length = res
+            else:
+                sample = res
+                valid_length = sample.shape[1]
+        elif hasattr(self, 'valid_lengths'):
+            valid_length = int(self.valid_lengths[idx].item())
+            
+        # Create boolean mask
+        max_frames = sample.shape[1]
+        mask = torch.zeros(max_frames, dtype=torch.bool)
+        mask[:valid_length] = True
         
         if isinstance(sample, torch.Tensor):
-            return sample.float(), torch.tensor(label, dtype=torch.long)
+            sample_tensor = sample.float()
         else:
-            return torch.FloatTensor(sample), torch.tensor(label, dtype=torch.long)
+            sample_tensor = torch.FloatTensor(sample)
+            
+        return sample_tensor, mask, torch.tensor(label, dtype=torch.long)
 
 
 def get_dataloaders(data_dir, batch_size=32, num_workers=4, transform=None, crop_min_ratio=0.6):
@@ -148,6 +172,7 @@ class MultiVSL200Dataset(Dataset):
             
         print(f"Preloading and preprocessing {len(self.files)} samples from {data_dir} ({'Train' if is_train else 'Val/Test'})...")
         self.samples = []
+        self.valid_lengths = []
         self.labels = []
         for f, label in self.files:
             file_path = os.path.join(self.data_dir, f)
@@ -158,13 +183,20 @@ class MultiVSL200Dataset(Dataset):
                 sample = self.augmentor(sample)
             
             # Pre-apply transform (interpolation, One Euro Filter, normalizations)
+            valid_length = sample.shape[1] # fallback
             if self.transform is not None:
-                sample = self.transform(sample)
+                res = self.transform(sample)
+                if isinstance(res, tuple):
+                    sample, valid_length = res
+                else:
+                    sample = res
+                    valid_length = sample.shape[1]
                 
             if isinstance(sample, torch.Tensor):
                 sample = sample.numpy()
                 
             self.samples.append(sample)
+            self.valid_lengths.append(valid_length)
             self.labels.append(label)
             
         # Clear transform since we pre-applied it
@@ -188,10 +220,23 @@ class MultiVSL200Dataset(Dataset):
             sample_np = self.augmentor(sample_np)
             sample = torch.from_numpy(sample_np).float()
             
-        if isinstance(sample, torch.Tensor):
-            return sample.float(), torch.tensor(label, dtype=torch.long)
+        # Get valid length
+        if hasattr(self, 'valid_lengths') and len(self.valid_lengths) > idx:
+            valid_length = self.valid_lengths[idx]
         else:
-            return torch.FloatTensor(sample), torch.tensor(label, dtype=torch.long)
+            valid_length = sample.shape[1]
+            
+        # Create boolean mask
+        max_frames = sample.shape[1]
+        mask = torch.zeros(max_frames, dtype=torch.bool)
+        mask[:valid_length] = True
+        
+        if isinstance(sample, torch.Tensor):
+            sample_tensor = sample.float()
+        else:
+            sample_tensor = torch.FloatTensor(sample)
+            
+        return sample_tensor, mask, torch.tensor(label, dtype=torch.long)
 
 
 def get_multivsl_loaders(data_dir, batch_size=32, num_workers=4, transform=None, split_method='random', crop_min_ratio=0.6):

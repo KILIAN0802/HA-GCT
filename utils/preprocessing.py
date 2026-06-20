@@ -203,6 +203,7 @@ class SkeletonTransforms:
         
         # Adjust temporal dimension to max_frames (pad or crop)
         T_curr, N_curr, C_curr = coords_out.shape
+        valid_length = min(T_curr, self.max_frames)
         if T_curr != self.max_frames:
             if T_curr > self.max_frames:
                 coords_out = coords_out[:self.max_frames]
@@ -214,7 +215,7 @@ class SkeletonTransforms:
         coords_tensor = torch.from_numpy(coords_out).float()
         coords_tensor = coords_tensor.permute(2, 0, 1).contiguous()
         
-        return coords_tensor
+        return coords_tensor, valid_length
 
 
 # ========== TEST MODULES ==========
@@ -253,9 +254,10 @@ if __name__ == '__main__':
     )
     
     # Run transform
-    out_tensor = transform(coords, confidence)
-    print(f"Output tensor shape: {out_tensor.shape} (C, T, N)")
+    out_tensor, valid_len = transform(coords, confidence)
+    print(f"Output tensor shape: {out_tensor.shape} (C, T, N), valid length: {valid_len}")
     assert out_tensor.shape == (2, 64, num_joints), "Incorrect transform shape!"
+    assert valid_len == 50, f"Incorrect valid length: {valid_len}"
     
     # Check that there are no NaNs
     assert not torch.isnan(out_tensor).any(), "Found NaNs in output!"

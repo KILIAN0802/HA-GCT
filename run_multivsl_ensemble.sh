@@ -23,7 +23,27 @@ MODEL_PATHS=()
 # 1. Train 3 models sequentially
 for SEED in "${SEEDS[@]}"; do
     echo "--------------------------------------------------------"
-    echo "[STAGE 1/2] Training Model with Seed: $SEED"
+    echo "[STAGE 1/3] Self-Supervised Pre-Training with Seed: $SEED"
+    echo "Start Time: $(date)"
+    echo "Logs will be written to: logs/${ENSEMBLE_RUN_ID}/pretrain_seed_${SEED}.log"
+    echo "--------------------------------------------------------"
+
+    python train.py \
+        --dataset multivsl200 \
+        --data-dir "/mnt/nvme2/users/utbt_sv1/data/MultiVSL200/raw_npy" \
+        --pretrain \
+        --pretrain-epochs 50 \
+        --pretrain-path "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/pretrained_ha_gct.pth" \
+        --seed "$SEED" \
+        --d-model 256 \
+        --batch-size 16 \
+        --accum-steps 8 \
+        --lr 7e-4 \
+        --save-dir "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/" \
+        > "logs/${ENSEMBLE_RUN_ID}/pretrain_seed_${SEED}.log" 2>&1
+
+    echo "--------------------------------------------------------"
+    echo "[STAGE 2/3] Fine-Tuning classification with Seed: $SEED"
     echo "Start Time: $(date)"
     echo "Logs will be written to: logs/${ENSEMBLE_RUN_ID}/seed_${SEED}.log"
     echo "--------------------------------------------------------"
@@ -31,7 +51,7 @@ for SEED in "${SEEDS[@]}"; do
     python train.py \
         --dataset multivsl200 \
         --data-dir "/mnt/nvme2/users/utbt_sv1/data/MultiVSL200/raw_npy" \
-        --pretrain-path "" \
+        --pretrain-path "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/pretrained_ha_gct.pth" \
         --seed "$SEED" \
         --model-type earlyfusion \
         --d-model 256 \
@@ -42,7 +62,8 @@ for SEED in "${SEEDS[@]}"; do
         --lr 7e-4 \
         --mixup-alpha 0.05 \
         --warmup-epochs 5 \
-        --drop-path-max 0.05 \
+        --drop-path-max 0.15 \
+        --dropout 0.3 \
         --label-smoothing 0.05 \
         --save-dir "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/" \
         > "logs/${ENSEMBLE_RUN_ID}/seed_${SEED}.log" 2>&1
@@ -144,14 +165,15 @@ correct_top5 = 0
 total = 0
 
 with torch.no_grad():
-    for batch_data, batch_labels in test_loader:
+    for batch_data, batch_mask, batch_labels in test_loader:
         batch_data = batch_data.to(device)
+        batch_mask = batch_mask.to(device)
         batch_labels = batch_labels.to(device)
         
         # Average logits directly: (logits1 + logits2 + logits3) / 3
-        logits1 = models[0](batch_data)
-        logits2 = models[1](batch_data)
-        logits3 = models[2](batch_data)
+        logits1 = models[0](batch_data, mask=batch_mask)
+        logits2 = models[1](batch_data, mask=batch_mask)
+        logits3 = models[2](batch_data, mask=batch_mask)
         
         logits = (logits1 + logits2 + logits3) / 3.0
         

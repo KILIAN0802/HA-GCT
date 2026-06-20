@@ -99,9 +99,13 @@ def get_dummy_loaders(args):
     test_labels = np.random.randint(0, args.num_classes, num_test)
     
     # Create simple tensor datasets
-    train_dataset = TensorDataset(torch.FloatTensor(train_data), torch.LongTensor(train_labels))
-    val_dataset = TensorDataset(torch.FloatTensor(val_data), torch.LongTensor(val_labels))
-    test_dataset = TensorDataset(torch.FloatTensor(test_data), torch.LongTensor(test_labels))
+    train_mask = torch.ones((num_train, 64), dtype=torch.bool)
+    val_mask = torch.ones((num_val, 64), dtype=torch.bool)
+    test_mask = torch.ones((num_test, 64), dtype=torch.bool)
+    
+    train_dataset = TensorDataset(torch.FloatTensor(train_data), train_mask, torch.LongTensor(train_labels))
+    val_dataset = TensorDataset(torch.FloatTensor(val_data), val_mask, torch.LongTensor(val_labels))
+    test_dataset = TensorDataset(torch.FloatTensor(test_data), test_mask, torch.LongTensor(test_labels))
     
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
@@ -148,11 +152,11 @@ class MaskedSkeletonAutoencoder(nn.Module):
         self.max_frames = max_frames
         self.in_channels = in_channels
         
-    def forward(self, x, mask):
+    def forward(self, x, mask, attention_mask=None):
         B, C, T, N = x.shape
         
         # STEP 1: Physical Embedding (takes (B, C, T, N) -> returns (B, T, N, D))
-        x_embed = self.encoder.physical_embedding(x)  # (B, T, N, D)
+        x_embed = self.encoder.physical_embedding(x, mask=attention_mask)  # (B, T, N, D)
         
         # Mask the joint embeddings
         mask_expanded = mask.unsqueeze(-1)  # (B, T, N, 1)
@@ -164,7 +168,20 @@ class MaskedSkeletonAutoencoder(nn.Module):
         for ha_gc_block in self.encoder.spatial_branch:
             x_spatial = ha_gc_block(x_spatial)
         x_spatial = x_spatial + self.encoder.spatial_temporal_conv(x_spatial)
-        x_spatial = 0.5 * (x_spatial.mean(dim=2) + x_spatial.max(dim=2)[0])
+        
+        if attention_mask is not None:
+            mask_spatial = attention_mask.view(B, 1, T, 1).expand(-1, x_spatial.size(1), -1, x_spatial.size(3))
+            sum_spatial = (x_spatial * mask_spatial).sum(dim=2)
+            count_spatial = mask_spatial.sum(dim=2).clamp(min=1)
+            mean_spatial = sum_spatial / count_spatial
+            
+            masked_for_max = x_spatial.masked_fill(~mask_spatial, -1e9)
+            max_spatial = masked_for_max.max(dim=2)[0]
+            
+            x_spatial = 0.5 * (mean_spatial + max_spatial)
+        else:
+            x_spatial = 0.5 * (x_spatial.mean(dim=2) + x_spatial.max(dim=2)[0])
+            
         x_spatial = x_spatial.transpose(1, 2)  # (B, N, D)
         
         # STEP 3: Temporal Branch (MHSA x2)
@@ -173,20 +190,42 @@ class MaskedSkeletonAutoencoder(nn.Module):
         joint_weight = torch.softmax(joint_score, dim=2)              # (B, T, N, 1)
         x_temporal = (x_embed * joint_weight).sum(dim=2)              # (B, T, D)
         
+        if attention_mask is not None:
+            x_temporal = x_temporal * attention_mask.unsqueeze(-1)
+            
         # Local temporal modeling (Depthwise Conv1D)
         x_conv = x_temporal.transpose(1, 2)
         x_conv = self.encoder.local_temporal_conv(x_conv)
         x_temporal = x_temporal + x_conv.transpose(1, 2)
+        
+        if attention_mask is not None:
+            x_temporal = x_temporal * attention_mask.unsqueeze(-1)
+            
         x_temporal = self.encoder.local_temporal_norm(x_temporal)
         
+        if attention_mask is not None:
+            x_temporal = x_temporal * attention_mask.unsqueeze(-1)
+            
         x_temporal = self.encoder.temporal_proj(x_temporal)
+        
+        if attention_mask is not None:
+            x_temporal = x_temporal * attention_mask.unsqueeze(-1)
         
         # MHSA Layer (standard dot-product attention)
         for mhsa_layer in self.encoder.temporal_branch:
-            x_temporal, attn_weights = mhsa_layer(x_temporal)
+            x_temporal, attn_weights = mhsa_layer(x_temporal, mask=attention_mask)
+            if attention_mask is not None:
+                x_temporal = x_temporal * attention_mask.unsqueeze(-1)
             
         # STEP 4: Gated Fusion & LayerNorm
-        x_temporal_mean = x_temporal.mean(dim=1, keepdim=True)  # (B, 1, D)
+        if attention_mask is not None:
+            mask_temp = attention_mask.unsqueeze(-1)  # (B, T, 1)
+            sum_temp = (x_temporal * mask_temp).sum(dim=1, keepdim=True)
+            count_temp = mask_temp.sum(dim=1, keepdim=True).clamp(min=1)
+            x_temporal_mean = sum_temp / count_temp
+        else:
+            x_temporal_mean = x_temporal.mean(dim=1, keepdim=True)  # (B, 1, D)
+            
         x_temporal_expanded = x_temporal_mean.expand(-1, x_spatial.size(1), -1)  # (B, N, D)
         
         gate_input = self.encoder.fusion_norm(torch.cat([
@@ -212,8 +251,9 @@ def pretrain_epoch(autoencoder, loader, optimizer, scheduler, device, epoch, sca
     use_amp = (device.type == 'cuda' and scaler is not None)
     
     progress_bar = tqdm(loader, desc=f"Epoch {epoch+1} [Pre-train]")
-    for step, (batch_data, _) in enumerate(progress_bar):
+    for step, (batch_data, batch_mask, _) in enumerate(progress_bar):
         batch_data = batch_data.to(device)
+        batch_mask = batch_mask.to(device)
         B, C, T, N = batch_data.shape
         
         mask = generate_mask_exact(B, T, N, device)
@@ -221,9 +261,11 @@ def pretrain_epoch(autoencoder, loader, optimizer, scheduler, device, epoch, sca
         
         if use_amp:
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                x_pred = autoencoder(batch_data, mask)
+                x_pred = autoencoder(batch_data, mask, attention_mask=batch_mask)
                 mask_expanded = mask.unsqueeze(-1).expand_as(x_gt)
-                loss = F.mse_loss(x_pred[mask_expanded], x_gt[mask_expanded])
+                valid_expanded = batch_mask.view(B, T, 1, 1).expand_as(x_gt)
+                loss_mask = mask_expanded & valid_expanded
+                loss = F.mse_loss(x_pred[loss_mask], x_gt[loss_mask])
             
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -233,9 +275,11 @@ def pretrain_epoch(autoencoder, loader, optimizer, scheduler, device, epoch, sca
             optimizer.zero_grad()
             scheduler.step()
         else:
-            x_pred = autoencoder(batch_data, mask)
+            x_pred = autoencoder(batch_data, mask, attention_mask=batch_mask)
             mask_expanded = mask.unsqueeze(-1).expand_as(x_gt)
-            loss = F.mse_loss(x_pred[mask_expanded], x_gt[mask_expanded])
+            valid_expanded = batch_mask.view(B, T, 1, 1).expand_as(x_gt)
+            loss_mask = mask_expanded & valid_expanded
+            loss = F.mse_loss(x_pred[loss_mask], x_gt[loss_mask])
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(autoencoder.parameters(), max_norm=1.0)
@@ -342,8 +386,9 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, device, epoch, s
     
     optimizer.zero_grad()
     progress_bar = tqdm(loader, desc=f"Epoch {epoch+1} [Train]")
-    for step, (batch_data, batch_labels) in enumerate(progress_bar):
+    for step, (batch_data, batch_mask, batch_labels) in enumerate(progress_bar):
         batch_data = batch_data.to(device)
+        batch_mask = batch_mask.to(device)
         batch_labels = batch_labels.to(device)
         
         # ==========================================
@@ -357,11 +402,12 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, device, epoch, s
         # Trộn ngẫu nhiên các sample trong cùng 1 batch
         index = torch.randperm(batch_data.size(0)).to(device)
         mixed_data = lam * batch_data + (1 - lam) * batch_data[index]
+        mixed_mask = batch_mask if lam >= 0.5 else batch_mask[index]
         # ==========================================
         
         if use_amp:
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                outputs = model(mixed_data)
+                outputs = model(mixed_data, mask=mixed_mask)
                 # Tính tổng loss của 2 nhãn được trộn
                 loss = lam * criterion(outputs, batch_labels) + (1 - lam) * criterion(outputs, batch_labels[index])
             
@@ -376,7 +422,7 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, device, epoch, s
                 optimizer.zero_grad()
                 scheduler.step()
         else:
-            outputs = model(mixed_data)
+            outputs = model(mixed_data, mask=mixed_mask)
             loss = lam * criterion(outputs, batch_labels) + (1 - lam) * criterion(outputs, batch_labels[index])
             
             loss = loss / ACCUM_STEPS
@@ -424,26 +470,37 @@ def eval_model(model, loader, criterion, device, desc="[Val]", use_tta=False):
         x_resampled = F.interpolate(x, size=new_T, mode='linear', align_corners=False)
         x_final = F.interpolate(x_resampled, size=T, mode='linear', align_corners=False)
         return x_final.reshape(B, C, V, T).permute(0, 1, 3, 2)
+        
+    def perturb_speed_mask(mask, rate):
+        B, T = mask.shape
+        m = mask.float().unsqueeze(1)
+        new_T = max(2, int(T * rate))
+        m_resampled = F.interpolate(m, size=new_T, mode='nearest')
+        m_final = F.interpolate(m_resampled, size=T, mode='nearest')
+        return m_final.squeeze(1) > 0.5
     
     progress_bar = tqdm(loader, desc=desc)
-    for batch_data, batch_labels in progress_bar:
+    for batch_data, batch_mask, batch_labels in progress_bar:
         batch_data = batch_data.to(device)
+        batch_mask = batch_mask.to(device)
         batch_labels = batch_labels.to(device)
         
         if use_amp:
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 if use_tta:
-                    out_orig = model(batch_data)
+                    out_orig = model(batch_data, mask=batch_mask)
                     
                     batch_flipped = batch_data.clone()
                     batch_flipped[:, 0, :, :] = -batch_flipped[:, 0, :, :]
-                    out_flipped = model(batch_flipped)
+                    out_flipped = model(batch_flipped, mask=batch_mask)
                     
                     batch_speed_09 = perturb_speed(batch_data, 0.9)
-                    out_speed_09 = model(batch_speed_09)
+                    mask_speed_09 = perturb_speed_mask(batch_mask, 0.9)
+                    out_speed_09 = model(batch_speed_09, mask=mask_speed_09)
                     
                     batch_speed_11 = perturb_speed(batch_data, 1.1)
-                    out_speed_11 = model(batch_speed_11)
+                    mask_speed_11 = perturb_speed_mask(batch_mask, 1.1)
+                    out_speed_11 = model(batch_speed_11, mask=mask_speed_11)
                     
                     prob_orig = F.softmax(out_orig, dim=-1)
                     prob_flipped = F.softmax(out_flipped, dim=-1)
@@ -453,21 +510,23 @@ def eval_model(model, loader, criterion, device, desc="[Val]", use_tta=False):
                     prob_avg = (prob_orig + prob_flipped + prob_speed_09 + prob_speed_11) / 4.0
                     outputs = torch.log(torch.clamp(prob_avg, min=1e-12))
                 else:
-                    outputs = model(batch_data)
+                    outputs = model(batch_data, mask=batch_mask)
                 loss = criterion(outputs, batch_labels)
         else:
             if use_tta:
-                out_orig = model(batch_data)
+                out_orig = model(batch_data, mask=batch_mask)
                 
                 batch_flipped = batch_data.clone()
                 batch_flipped[:, 0, :, :] = -batch_flipped[:, 0, :, :]
-                out_flipped = model(batch_flipped)
+                out_flipped = model(batch_flipped, mask=batch_mask)
                 
                 batch_speed_09 = perturb_speed(batch_data, 0.9)
-                out_speed_09 = model(batch_speed_09)
+                mask_speed_09 = perturb_speed_mask(batch_mask, 0.9)
+                out_speed_09 = model(batch_speed_09, mask=mask_speed_09)
                 
                 batch_speed_11 = perturb_speed(batch_data, 1.1)
-                out_speed_11 = model(batch_speed_11)
+                mask_speed_11 = perturb_speed_mask(batch_mask, 1.1)
+                out_speed_11 = model(batch_speed_11, mask=mask_speed_11)
                 
                 prob_orig = F.softmax(out_orig, dim=-1)
                 prob_flipped = F.softmax(out_flipped, dim=-1)
@@ -477,7 +536,7 @@ def eval_model(model, loader, criterion, device, desc="[Val]", use_tta=False):
                 prob_avg = (prob_orig + prob_flipped + prob_speed_09 + prob_speed_11) / 4.0
                 outputs = torch.log(torch.clamp(prob_avg, min=1e-12))
             else:
-                outputs = model(batch_data)
+                outputs = model(batch_data, mask=batch_mask)
             loss = criterion(outputs, batch_labels)
         
         total_loss += loss.item()
@@ -793,7 +852,7 @@ def main():
         optimizer, start_factor=start_factor, end_factor=1.0, total_iters=warmup_steps
     )
     cosine_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=T_0_steps, T_mult=1, eta_min=1e-6
+        optimizer, T_0=T_0_steps, T_mult=2, eta_min=1e-6
     )
     scheduler = optim.lr_scheduler.SequentialLR(
         optimizer,
@@ -855,8 +914,9 @@ def main():
         print("=" * 70)
         
         # Get one single batch from train_loader
-        batch_data, batch_labels = next(iter(train_loader))
+        batch_data, batch_mask, batch_labels = next(iter(train_loader))
         batch_data = batch_data.to(device)
+        batch_mask = batch_mask.to(device)
         batch_labels = batch_labels.to(device)
         
         print(f"Batch shape: {batch_data.shape}")
@@ -870,7 +930,7 @@ def main():
         model.train()
         for step in range(500):
             optimizer.zero_grad()
-            outputs = model(batch_data)
+            outputs = model(batch_data, mask=batch_mask)
             loss = criterion(outputs, batch_labels)
             loss.backward()
             optimizer.step()
@@ -928,12 +988,12 @@ def main():
             print(f"New best model saved with Val Acc (Top-1): {best_acc*100:.2f}%")
             if use_wandb:
                 wandb.save(best_path)
-        # else:
-        #     patience_counter += 1
-        #     print(f"Early Stopping Counter: {patience_counter}/{args.patience}")
-        #     if patience_counter >= args.patience:
-        #         print(f"Early stopping triggered! Training stopped after {epoch+1} epochs because Val Acc (Top-1) did not improve for {args.patience} epochs.")
-        #         break
+        else:
+            patience_counter += 1
+            print(f"Early Stopping Counter: {patience_counter}/{args.patience}")
+            if patience_counter >= args.patience:
+                print(f"Early stopping triggered! Training stopped after {epoch+1} epochs because Val Acc (Top-1) did not improve for {args.patience} epochs.")
+                break
             
         # Periodic save (save full training state for resume capability)
         if (epoch + 1) % 10 == 0:

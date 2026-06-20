@@ -30,10 +30,11 @@ class PhysicalEmbedding(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, x):
+    def forward(self, x, mask=None):
         """
         Args:
             x: Input tensor shape (B, C, T, V)
+            mask: Optional mask shape (B, T)
         Returns:
             out: Embedded tensor shape (B, T, V, D)
         """
@@ -58,7 +59,13 @@ class PhysicalEmbedding(nn.Module):
         out = x_proj + self.joint_embed[:, :, :V, :] + pe_t
         out = self.norm(out)
         
-        return self.dropout(out)
+        out = self.dropout(out)
+        
+        if mask is not None:
+            # mask shape: (B, T) -> (B, T, 1, 1)
+            out = out * mask.view(B, T, 1, 1)
+            
+        return out
 
 if __name__ == '__main__':
     print("=" * 70)

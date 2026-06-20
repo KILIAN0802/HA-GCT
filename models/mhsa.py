@@ -270,8 +270,16 @@ class GraphAugmentedAttention(nn.Module):
         # Standard scaled dot-product attention: (B, h, T, T)
         attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
         
+        if mask is not None:
+            # mask shape: (B, T) -> (B, 1, 1, T)
+            mask_expanded = mask.view(B, 1, 1, T)
+            attn_scores = attn_scores.masked_fill(~mask_expanded, -1e9)
+            
         # Softmax & Dropout
         attn_weights = F.softmax(attn_scores, dim=-1)  # (B, h, T, T)
+        if mask is not None:
+            attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
+            
         attn_weights = self.attn_dropout(attn_weights)
         
         # Attend to values: (B, h, T, d_k)

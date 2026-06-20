@@ -35,7 +35,8 @@ def get_dummy_loaders(args):
     test_data = np.random.randn(num_test, args.in_channels, 64, args.num_point).astype(np.float32)
     # Determine number of classes from loaded checkpoints or default to 400
     test_labels = np.random.randint(0, 400, num_test)
-    test_dataset = TensorDataset(torch.FloatTensor(test_data), torch.LongTensor(test_labels))
+    test_mask = torch.ones((num_test, 64), dtype=torch.bool)
+    test_dataset = TensorDataset(torch.FloatTensor(test_data), test_mask, torch.LongTensor(test_labels))
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
     return test_loader
 
@@ -46,6 +47,14 @@ def perturb_speed(batch, rate):
     x_resampled = F.interpolate(x, size=new_T, mode='linear', align_corners=False)
     x_final = F.interpolate(x_resampled, size=T, mode='linear', align_corners=False)
     return x_final.reshape(B, C, V, T).permute(0, 1, 3, 2)
+
+def perturb_speed_mask(mask, rate):
+    B, T = mask.shape
+    m = mask.float().unsqueeze(1)
+    new_T = max(2, int(T * rate))
+    m_resampled = F.interpolate(m, size=new_T, mode='nearest')
+    m_final = F.interpolate(m_resampled, size=T, mode='nearest')
+    return m_final.squeeze(1) > 0.5
 
 def topk_accuracy(output, target, topk=(1, 5)):
     with torch.no_grad():
@@ -148,8 +157,9 @@ def main():
     
     print("\nRunning ensemble inference...")
     with torch.no_grad():
-        for batch_data, batch_labels in tqdm(test_loader, desc="[Ensemble Inference]"):
+        for batch_data, batch_mask, batch_labels in tqdm(test_loader, desc="[Ensemble Inference]"):
             batch_data = batch_data.to(device)
+            batch_mask = batch_mask.to(device)
             
             # Store probabilities for this batch from each model
             batch_probs = []
@@ -158,17 +168,19 @@ def main():
                 if use_amp:
                     with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                         if args.tta:
-                            out_orig = model(batch_data)
+                            out_orig = model(batch_data, mask=batch_mask)
                             
                             batch_flipped = batch_data.clone()
                             batch_flipped[:, 0, :, :] = -batch_flipped[:, 0, :, :]
-                            out_flipped = model(batch_flipped)
+                            out_flipped = model(batch_flipped, mask=batch_mask)
                             
                             batch_speed_09 = perturb_speed(batch_data, 0.9)
-                            out_speed_09 = model(batch_speed_09)
+                            mask_speed_09 = perturb_speed_mask(batch_mask, 0.9)
+                            out_speed_09 = model(batch_speed_09, mask=mask_speed_09)
                             
                             batch_speed_11 = perturb_speed(batch_data, 1.1)
-                            out_speed_11 = model(batch_speed_11)
+                            mask_speed_11 = perturb_speed_mask(batch_mask, 1.1)
+                            out_speed_11 = model(batch_speed_11, mask=mask_speed_11)
                             
                             prob_orig = F.softmax(out_orig, dim=-1)
                             prob_flipped = F.softmax(out_flipped, dim=-1)
@@ -177,21 +189,23 @@ def main():
                             
                             model_prob = (prob_orig + prob_flipped + prob_speed_09 + prob_speed_11) / 4.0
                         else:
-                            out = model(batch_data)
+                            out = model(batch_data, mask=batch_mask)
                             model_prob = F.softmax(out, dim=-1)
                 else:
                     if args.tta:
-                        out_orig = model(batch_data)
+                        out_orig = model(batch_data, mask=batch_mask)
                         
                         batch_flipped = batch_data.clone()
                         batch_flipped[:, 0, :, :] = -batch_flipped[:, 0, :, :]
-                        out_flipped = model(batch_flipped)
+                        out_flipped = model(batch_flipped, mask=batch_mask)
                         
                         batch_speed_09 = perturb_speed(batch_data, 0.9)
-                        out_speed_09 = model(batch_speed_09)
+                        mask_speed_09 = perturb_speed_mask(batch_mask, 0.9)
+                        out_speed_09 = model(batch_speed_09, mask=mask_speed_09)
                         
                         batch_speed_11 = perturb_speed(batch_data, 1.1)
-                        out_speed_11 = model(batch_speed_11)
+                        mask_speed_11 = perturb_speed_mask(batch_mask, 1.1)
+                        out_speed_11 = model(batch_speed_11, mask=mask_speed_11)
                         
                         prob_orig = F.softmax(out_orig, dim=-1)
                         prob_flipped = F.softmax(out_flipped, dim=-1)
@@ -200,7 +214,7 @@ def main():
                         
                         model_prob = (prob_orig + prob_flipped + prob_speed_09 + prob_speed_11) / 4.0
                     else:
-                        out = model(batch_data)
+                        out = model(batch_data, mask=batch_mask)
                         model_prob = F.softmax(out, dim=-1)
                         
                 batch_probs.append(model_prob)

@@ -124,7 +124,7 @@ class HA_GCT(nn.Module):
             num_classes=num_classes
         )
     
-    def forward(self, x, return_embedding=False):
+    def forward(self, x, mask=None, return_embedding=False):
         """
         Input: x shape (B, C, T, V)
         Output: (B, num_classes) or (B, V, D)
@@ -132,7 +132,7 @@ class HA_GCT(nn.Module):
         B, C, T, V = x.shape
         
         # STEP 1: Physical Embedding (takes (B, C, T, V) -> returns (B, T, V, D))
-        x_embed = self.physical_embedding(x)  # (B, T, V, D)
+        x_embed = self.physical_embedding(x, mask=mask)  # (B, T, V, D)
         
         # STEP 2: Spatial Branch (HA-GC x3)
         # HA-GC expects shape (B, D, T, V)
@@ -145,10 +145,24 @@ class HA_GCT(nn.Module):
         x_spatial = x_spatial + self.spatial_temporal_conv(x_spatial)
         
         # Pool over time: (B, D, T, V) -> (B, D, V)
-        x_spatial = 0.5 * (
-            x_spatial.mean(dim=2) +
-            x_spatial.max(dim=2)[0]
-        )
+        if mask is not None:
+            mask_expanded = mask.view(B, 1, T, 1).expand(-1, x_spatial.size(1), -1, x_spatial.size(3))
+            
+            # Masked mean
+            sum_spatial = (x_spatial * mask_expanded).sum(dim=2)
+            count_spatial = mask_expanded.sum(dim=2).clamp(min=1)
+            mean_spatial = sum_spatial / count_spatial
+            
+            # Masked max
+            masked_for_max = x_spatial.masked_fill(~mask_expanded, -1e9)
+            max_spatial = masked_for_max.max(dim=2)[0]
+            
+            x_spatial = 0.5 * (mean_spatial + max_spatial)
+        else:
+            x_spatial = 0.5 * (
+                x_spatial.mean(dim=2) +
+                x_spatial.max(dim=2)[0]
+            )
         # Transpose: (B, D, V) -> (B, V, D)
         x_spatial = x_spatial.transpose(1, 2)
         
@@ -158,21 +172,42 @@ class HA_GCT(nn.Module):
         joint_weight = torch.softmax(joint_score, dim=2)      # (B, T, V, 1)
         x_temporal = (x_embed * joint_weight).sum(dim=2)      # (B, T, D)
         
+        if mask is not None:
+            x_temporal = x_temporal * mask.unsqueeze(-1)
+        
         # Local temporal modeling (Depthwise Conv1D)
         x_conv = x_temporal.transpose(1, 2)
         x_conv = self.local_temporal_conv(x_conv)
         x_temporal = x_temporal + x_conv.transpose(1, 2)
+        
+        if mask is not None:
+            x_temporal = x_temporal * mask.unsqueeze(-1)
+            
         x_temporal = self.local_temporal_norm(x_temporal)
+        
+        if mask is not None:
+            x_temporal = x_temporal * mask.unsqueeze(-1)
         
         x_temporal = self.temporal_proj(x_temporal)
         
+        if mask is not None:
+            x_temporal = x_temporal * mask.unsqueeze(-1)
+        
         # MHSA Layer (simplified standard dot-product attention)
         for mhsa_layer in self.temporal_branch:
-            x_temporal, attn_weights = mhsa_layer(x_temporal)
+            x_temporal, attn_weights = mhsa_layer(x_temporal, mask=mask)
+            if mask is not None:
+                x_temporal = x_temporal * mask.unsqueeze(-1)
         
         # STEP 4: Fusion using cross-gating
         # Fusion between spatial (x_spatial) and temporal (x_temporal)
-        x_temporal_mean = x_temporal.mean(dim=1, keepdim=True)  # (B, 1, D)
+        if mask is not None:
+            mask_temp = mask.unsqueeze(-1)  # (B, T, 1)
+            sum_temp = (x_temporal * mask_temp).sum(dim=1, keepdim=True)  # (B, 1, D)
+            count_temp = mask_temp.sum(dim=1, keepdim=True).clamp(min=1)  # (B, 1, 1)
+            x_temporal_mean = sum_temp / count_temp  # (B, 1, D)
+        else:
+            x_temporal_mean = x_temporal.mean(dim=1, keepdim=True)  # (B, 1, D)
         x_temporal_expanded = x_temporal_mean.expand(-1, x_spatial.size(1), -1)  # (B, V, D)
         
         gate_input = self.fusion_norm(torch.cat([
@@ -227,8 +262,8 @@ class MultiStreamHA_GCT(nn.Module):
             drop_path_max=drop_path_max
         )
         
-    def forward(self, joint):
-        output = self.stream_joint(joint)
+    def forward(self, joint, mask=None):
+        output = self.stream_joint(joint, mask=mask)
         return output
 
 class EarlyFusionHA_GCT(nn.Module):
@@ -313,7 +348,7 @@ class EarlyFusionHA_GCT(nn.Module):
         velocity[:, :, 1:, :] = joint[:, :, 1:, :] - joint[:, :, :-1, :]
         return velocity
 
-    def forward(self, joint):
+    def forward(self, joint, mask=None):
         # Compute streams dynamically on target device
         bone = self._compute_bone(joint)
         velocity = self._compute_velocity(joint)
@@ -322,7 +357,7 @@ class EarlyFusionHA_GCT(nn.Module):
         x = torch.cat([joint, bone, velocity], dim=1)
         
         # Return the output of self.ha_gct(x)
-        return self.ha_gct(x)
+        return self.ha_gct(x, mask=mask)
 
 if __name__ == '__main__':
     print("=" * 70)
@@ -355,11 +390,18 @@ if __name__ == '__main__':
     
     print(f"\nHA-GCT Network Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    # Forward pass
+    # Forward pass without mask
     output = model(x)
-    print(f"Output logits shape: {output.shape} (B, num_classes)")
-    
+    print(f"Output logits shape (unmasked): {output.shape} (B, num_classes)")
     assert output.shape == (batch_size, num_classes), "Incorrect output shape!"
+    
+    # Forward pass with mask
+    mask = torch.ones((batch_size, num_frames), dtype=torch.bool)
+    mask[:, 50:] = False # simulate padding
+    output_masked = model(x, mask=mask)
+    print(f"Output logits shape (masked): {output_masked.shape} (B, num_classes)")
+    assert output_masked.shape == (batch_size, num_classes), "Incorrect output shape!"
+    
     print("\nHA-GCT FULL NETWORK TEST PASSED!")
     print("=" * 70)
     
@@ -382,8 +424,8 @@ if __name__ == '__main__':
     )
     
     print(f"Multi-Stream HA-GCT Parameters: {sum(p.numel() for p in ms_model.parameters()):,}")
-    ms_output = ms_model(x)
-    print(f"Multi-Stream Output shape: {ms_output.shape}")
+    ms_output = ms_model(x, mask=mask)
+    print(f"Multi-Stream Output shape (masked): {ms_output.shape}")
     assert ms_output.shape == (batch_size, num_classes), "Incorrect Multi-Stream output shape!"
     print("\nMULTI-STREAM HA-GCT TEST PASSED!")
     print("=" * 70)
@@ -407,8 +449,8 @@ if __name__ == '__main__':
     )
     
     print(f"Early Fusion HA-GCT Parameters: {sum(p.numel() for p in ef_model.parameters()):,}")
-    ef_output = ef_model(x)
-    print(f"Early Fusion Output shape: {ef_output.shape}")
+    ef_output = ef_model(x, mask=mask)
+    print(f"Early Fusion Output shape (masked): {ef_output.shape}")
     assert ef_output.shape == (batch_size, num_classes), "Incorrect Early Fusion output shape!"
     print("\nEARLY FUSION HA-GCT TEST PASSED!")
     print("=" * 70)
