@@ -273,7 +273,7 @@ class GraphAugmentedAttention(nn.Module):
         if mask is not None:
             # mask shape: (B, T) -> (B, 1, 1, T)
             mask_expanded = mask.view(B, 1, 1, T)
-            attn_scores = attn_scores.masked_fill(~mask_expanded, -1e9)
+            attn_scores = attn_scores.masked_fill(~mask_expanded, -10000.0)
             
         # Softmax & Dropout
         attn_weights = F.softmax(attn_scores, dim=-1)  # (B, h, T, T)

@@ -154,7 +154,7 @@ class HA_GCT(nn.Module):
             mean_spatial = sum_spatial / count_spatial
             
             # Masked max
-            masked_for_max = x_spatial.masked_fill(~mask_expanded, -1e9)
+            masked_for_max = x_spatial.masked_fill(~mask_expanded, -10000.0)
             max_spatial = masked_for_max.max(dim=2)[0]
             
             x_spatial = 0.5 * (mean_spatial + max_spatial)

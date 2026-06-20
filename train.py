@@ -175,7 +175,7 @@ class MaskedSkeletonAutoencoder(nn.Module):
             count_spatial = mask_spatial.sum(dim=2).clamp(min=1)
             mean_spatial = sum_spatial / count_spatial
             
-            masked_for_max = x_spatial.masked_fill(~mask_spatial, -1e9)
+            masked_for_max = x_spatial.masked_fill(~mask_spatial, -10000.0)
             max_spatial = masked_for_max.max(dim=2)[0]
             
             x_spatial = 0.5 * (mean_spatial + max_spatial)
