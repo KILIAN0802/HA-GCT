@@ -62,3 +62,6 @@ runs/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Weights & Biases
+wandb/

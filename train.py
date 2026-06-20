@@ -39,7 +39,7 @@ def parse_args():
     parser.add_argument('--log-dir', type=str, default='results/logs', help='Directory for TensorBoard logs')
     
     # wandb & dataset options
-    parser.add_argument('--no-wandb', action='store_true', help='Disable Weights & Biases logging')
+    parser.add_argument('--use-wandb', action='store_true', help='Enable Weights & Biases logging')
     parser.add_argument('--wandb-project', type=str, default='HA-GCT', help='Weights & Biases project name')
     parser.add_argument('--wandb-entity', type=str, default='', help='Weights & Biases entity (username or team)')
     parser.add_argument('--dataset', type=str, default='vsl400', choices=['vsl400', 'multivsl200'], help='Dataset selection')
@@ -590,9 +590,9 @@ def main():
         print(f"Auto-configured num_classes to 199 for MultiVSL200 dataset.")
         
     # Initialize wandb if requested and available
-    use_wandb = (not args.no_wandb) and WANDB_AVAILABLE
+    use_wandb = args.use_wandb and WANDB_AVAILABLE
     
-    if not args.no_wandb and not WANDB_AVAILABLE:
+    if args.use_wandb and not WANDB_AVAILABLE:
         print("=" * 70)
         print("WARNING: Weights & Biases (wandb) is not installed or import failed.")
         print("         Logs will NOT be sent to wandb.")
