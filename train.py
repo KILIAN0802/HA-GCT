@@ -304,28 +304,28 @@ def load_pretrained_encoder(model, pretrained_path, device):
     pretrained_dict = {k: v for k, v in pretrained_dict.items() if not k.startswith('classifier')}
     model_dict = model.state_dict()
     
-    for stream_name in ['stream_joint', 'stream_bone', 'stream_velocity']:
+    possible_prefixes = ['ha_gct', 'stream_joint', 'stream_bone', 'stream_velocity', '']
+    
+    for prefix in possible_prefixes:
         mapped_dict = {}
         skipped = []
         for k, v in pretrained_dict.items():
-            mapped_key = f"{stream_name}.{k}"
-            if mapped_key in model_dict and model_dict[mapped_key].shape == v.shape:
-                mapped_dict[mapped_key] = v
-            else:
-                skipped.append((
-                    mapped_key,
-                    tuple(v.shape),
-                    tuple(model_dict[mapped_key].shape) if mapped_key in model_dict else None
-                ))
-                
+            mapped_key = f"{prefix}.{k}" if prefix else k
+            if mapped_key in model_dict:
+                if model_dict[mapped_key].shape == v.shape:
+                    mapped_dict[mapped_key] = v
+                else:
+                    skipped.append(f"{mapped_key} (shape mismatch: target {tuple(model_dict[mapped_key].shape)} vs pretrained {tuple(v.shape)})")
+            
         if mapped_dict:
             model.load_state_dict(mapped_dict, strict=False)
-            print(f"  Initialized {stream_name} with {len(mapped_dict)} matched tensors.")
-        else:
-            print(f"  Skipped {stream_name}: no compatible pretrained tensors.")
-            
-        if skipped and len(mapped_dict) > 0:
-            print(f"  Skipped {len(skipped)} incompatible/missing tensors for {stream_name}.")
+            print(f"  Loaded prefix '{prefix}' with {len(mapped_dict)} matched tensors.")
+            if skipped:
+                print(f"  Skipped {len(skipped)} tensors in '{prefix}' due to shape mismatch (expected for input projection layer).")
+                for s in skipped[:3]:
+                    print(f"    - {s}")
+                if len(skipped) > 3:
+                    print(f"    - ... and {len(skipped) - 3} more.")
 
 def get_dataset_labels(dataset):
     if isinstance(dataset, torch.utils.data.Subset):
