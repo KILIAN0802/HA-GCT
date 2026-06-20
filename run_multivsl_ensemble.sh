@@ -17,7 +17,8 @@ echo "Ensemble Run ID: $ENSEMBLE_RUN_ID"
 mkdir -p "logs/$ENSEMBLE_RUN_ID"
 mkdir -p "checkpoints/$ENSEMBLE_RUN_ID"
 
-SEEDS=(42 43 44)
+SEEDS=(42)
+# SEEDS=(42 43 44)
 MODEL_PATHS=()
 
 # 1. Train 3 models sequentially
@@ -113,14 +114,15 @@ from models.ha_gct import EarlyFusionHA_GCT
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Ensemble Evaluation Device: {device}")
 
+# Load all available models
 model_paths = [os.environ.get("MODEL1_PATH"), os.environ.get("MODEL2_PATH"), os.environ.get("MODEL3_PATH")]
+model_paths = [p for p in model_paths if p and os.path.exists(p)]
 
-# Load all 3 models
+if not model_paths:
+    raise ValueError("No valid model paths found for evaluation!")
+
 models = []
 for idx, path in enumerate(model_paths):
-    if not path or not os.path.exists(path):
-        raise ValueError(f"Model path {path} does not exist!")
-    
     model = EarlyFusionHA_GCT(
         num_joints=27,
         in_channels=2,
@@ -170,12 +172,9 @@ with torch.no_grad():
         batch_mask = batch_mask.to(device)
         batch_labels = batch_labels.to(device)
         
-        # Average logits directly: (logits1 + logits2 + logits3) / 3
-        logits1 = models[0](batch_data, mask=batch_mask)
-        logits2 = models[1](batch_data, mask=batch_mask)
-        logits3 = models[2](batch_data, mask=batch_mask)
-        
-        logits = (logits1 + logits2 + logits3) / 3.0
+        # Average logits directly across available models
+        outputs_list = [m(batch_data, mask=batch_mask) for m in models]
+        logits = torch.stack(outputs_list, dim=0).mean(dim=0)
         
         num_classes = logits.size(1)
         maxk = min(5, num_classes)
