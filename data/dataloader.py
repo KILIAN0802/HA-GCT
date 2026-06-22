@@ -178,10 +178,6 @@ class MultiVSL200Dataset(Dataset):
             file_path = os.path.join(self.data_dir, f)
             sample = np.load(file_path)
             sample = sample.transpose(2, 0, 1)
-
-            if self.augmentor is not None:
-                sample = self.augmentor(sample)
-            
             # Pre-apply transform (interpolation, One Euro Filter, normalizations)
             valid_length = sample.shape[1] # fallback
             if self.transform is not None:
