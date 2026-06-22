@@ -229,7 +229,7 @@ class HA_GCT(nn.Module):
 
 class MultiStreamHA_GCT(nn.Module):
     """
-    Multi-Stream HA-GCT (Late Fusion of Joint, Bone, and Velocity) - Simplified to Single Stream (Joint Only)
+    Multi-Stream HA-GCT (Late Fusion of Joint, Bone, and Velocity)
     """
     def __init__(
         self,
@@ -261,9 +261,106 @@ class MultiStreamHA_GCT(nn.Module):
             max_frames=max_frames,
             drop_path_max=drop_path_max
         )
+
+        # Stream 2: Bone
+        self.stream_bone = HA_GCT(
+            num_joints=num_joints,
+            in_channels=in_channels,
+            d_model=d_model,
+            num_ha_gc_blocks=num_ha_gc_blocks,
+            num_mhsa_layers=num_mhsa_layers,
+            nhead=nhead,
+            num_classes=num_classes,
+            dropout=dropout,
+            graph_lambda=graph_lambda,
+            max_frames=max_frames,
+            drop_path_max=drop_path_max
+        )
+
+        # Stream 3: Velocity
+        self.stream_velocity = HA_GCT(
+            num_joints=num_joints,
+            in_channels=in_channels,
+            d_model=d_model,
+            num_ha_gc_blocks=num_ha_gc_blocks,
+            num_mhsa_layers=num_mhsa_layers,
+            nhead=nhead,
+            num_classes=num_classes,
+            dropout=dropout,
+            graph_lambda=graph_lambda,
+            max_frames=max_frames,
+            drop_path_max=drop_path_max
+        )
         
+        # Skeleton topology mapping for bone calculation
+        self.parents = {
+            0: None,   # Nose / Root
+            1: 0,      # Shoulder L
+            2: 0,      # Shoulder R
+            3: 1,      # Elbow L
+            4: 2,      # Elbow R
+            5: 3,      # Wrist L
+            6: 4,      # Wrist R
+            7: 5,      # Palm L
+            17: 6,     # Palm R
+            8: 7,      # Thumb L
+            9: 7,      # Index L root
+            10: 9,     # Index L tip
+            11: 7,     # Middle L root
+            12: 11,    # Middle L tip
+            13: 7,     # Ring L root
+            14: 13,    # Ring L tip
+            15: 7,     # Pinky L root
+            16: 15,    # Pinky L tip
+            18: 17,    # Thumb R
+            19: 17,    # Index R root
+            20: 19,    # Index R tip
+            21: 17,    # Middle R root
+            22: 21,    # Middle R tip
+            23: 17,    # Ring R root
+            24: 23,    # Ring R tip
+            25: 17,    # Pinky R root
+            26: 25     # Pinky R tip
+        }
+
+        # Classification Head for concatenated features: 3 * d_model
+        self.classifier = SimpleClassificationHead(
+            d_model=3 * d_model,
+            num_classes=num_classes,
+            dropout=dropout
+        )
+        
+    def _compute_bone(self, joint):
+        # joint shape: (B, C, T, V)
+        B, C, T, V = joint.shape
+        bone = torch.zeros_like(joint)
+        for child, parent in self.parents.items():
+            if parent is not None:
+                bone[:, :, :, child] = joint[:, :, :, child] - joint[:, :, :, parent]
+        return bone
+
+    def _compute_velocity(self, joint):
+        # joint shape: (B, C, T, V)
+        B, C, T, V = joint.shape
+        velocity = torch.zeros_like(joint)
+        velocity[:, :, 1:, :] = joint[:, :, 1:, :] - joint[:, :, :-1, :]
+        return velocity
+
     def forward(self, joint, mask=None):
-        output = self.stream_joint(joint, mask=mask)
+        # Compute bone and velocity dynamically
+        bone = self._compute_bone(joint)
+        velocity = self._compute_velocity(joint)
+
+        # Extract (B, V, D) embeddings from each stream
+        feat_joint = self.stream_joint(joint, mask=mask, return_embedding=True)
+        feat_bone = self.stream_bone(bone, mask=mask, return_embedding=True)
+        feat_velocity = self.stream_velocity(velocity, mask=mask, return_embedding=True)
+
+        # Late Fusion: Concatenate features along the channel/feature dimension
+        feat_fused = torch.cat([feat_joint, feat_bone, feat_velocity], dim=-1)  # (B, V, 3 * D)
+
+        # Classify concatenated representation
+        output = self.classifier(feat_fused)  # (B, num_classes)
         return output
 
 class EarlyFusionHA_GCT(nn.Module):

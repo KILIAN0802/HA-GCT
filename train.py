@@ -68,6 +68,8 @@ def parse_args():
     parser.add_argument('--warmup-epochs', type=int, default=5, help='Number of warmup epochs')
     parser.add_argument('--accum-steps', type=int, default=4, help='Gradient accumulation steps')
     parser.add_argument('--overfit-one-batch', action='store_true', help='Sanity check: train on a single batch for 500 steps to check convergence')
+    parser.add_argument('--use-ema', action='store_true', help='Use Exponential Moving Average (EMA) of model weights')
+    parser.add_argument('--ema-decay', type=float, default=0.999, help='Decay rate for weight EMA')
     
     return parser.parse_args()
 
@@ -245,6 +247,21 @@ class MaskedSkeletonAutoencoder(nn.Module):
         
         return out
 
+class ModelEMA:
+    def __init__(self, model, decay=0.999):
+        import copy
+        self.ema_model = copy.deepcopy(model)
+        self.decay = decay
+        for p in self.ema_model.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        for ema_p, model_p in zip(self.ema_model.parameters(), model.parameters()):
+            ema_p.data.mul_(self.decay).add_(model_p.data, alpha=1 - self.decay)
+        for ema_b, model_b in zip(self.ema_model.buffers(), model.buffers()):
+            ema_b.copy_(model_b)
+
 def pretrain_epoch(autoencoder, loader, optimizer, scheduler, device, epoch, scaler=None):
     autoencoder.train()
     total_loss = 0.0
@@ -372,7 +389,7 @@ def topk_accuracy_count(output, target, topk=(1, 5)):
                 res.append(correct_k)
         return res
 
-def train_epoch(model, loader, criterion, optimizer, scheduler, device, epoch, scaler=None, mixup_alpha=0.0, accum_steps=4):
+def train_epoch(model, loader, criterion, optimizer, scheduler, device, epoch, scaler=None, mixup_alpha=0.0, accum_steps=4, model_ema=None):
     model.train()
     total_loss = 0.0
     correct_top1 = 0
@@ -421,6 +438,8 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, device, epoch, s
                 scaler.update()
                 optimizer.zero_grad()
                 scheduler.step()
+                if model_ema is not None:
+                    model_ema.update(model)
         else:
             outputs = model(mixed_data, mask=mixed_mask)
             loss = lam * criterion(outputs, batch_labels) + (1 - lam) * criterion(outputs, batch_labels[index])
@@ -433,6 +452,8 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, device, epoch, s
                 optimizer.step()
                 optimizer.zero_grad()
                 scheduler.step()
+                if model_ema is not None:
+                    model_ema.update(model)
         
         loss_val = loss.item() * ACCUM_STEPS
         total_loss += loss_val
@@ -831,6 +852,11 @@ def main():
     else:
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
+    model_ema = None
+    if args.use_ema:
+        print(f"Initializing Model EMA with decay: {args.ema_decay}")
+        model_ema = ModelEMA(model, decay=args.ema_decay)
+    
     # Sequential learning rate scheduler with Linear Warm-up & Cosine Annealing Warm Restarts (Step-based)
     ACCUM_STEPS = args.accum_steps
     steps_per_epoch = max(1, (len(train_loader) + ACCUM_STEPS - 1) // ACCUM_STEPS)
@@ -887,6 +913,9 @@ def main():
             if 'patience_counter' in checkpoint:
                 patience_counter = checkpoint['patience_counter']
                 print(f"Restored patience counter: {patience_counter}")
+            if 'model_ema_state_dict' in checkpoint and model_ema is not None:
+                model_ema.ema_model.load_state_dict(checkpoint['model_ema_state_dict'])
+                print("Restored Model EMA state.")
         else:
             model.load_state_dict(checkpoint)
             filename = os.path.basename(args.resume)
@@ -946,8 +975,11 @@ def main():
         
     print("\nStarting training loops...")
     for epoch in range(start_epoch, args.epochs):
-        train_loss, train_acc_top1, train_acc_top5 = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch, scaler, mixup_alpha=args.mixup_alpha, accum_steps=args.accum_steps)
-        val_loss, val_acc_top1, val_acc_top5 = eval_model(model, val_loader, criterion, device, desc=f"Epoch {epoch+1} [Val]", use_tta=args.tta)
+        train_loss, train_acc_top1, train_acc_top5 = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch, scaler, mixup_alpha=args.mixup_alpha, accum_steps=args.accum_steps, model_ema=model_ema)
+        
+        # If using EMA, we evaluate using the EMA model
+        eval_model_obj = model_ema.ema_model if model_ema is not None else model
+        val_loss, val_acc_top1, val_acc_top5 = eval_model(eval_model_obj, val_loader, criterion, device, desc=f"Epoch {epoch+1} [Val]", use_tta=args.tta)
         
         # Log to tensorboard
         writer.add_scalar('Loss/train', train_loss, epoch)
@@ -977,14 +1009,17 @@ def main():
             best_acc = val_acc_top1
             patience_counter = 0
             best_path = os.path.join(run_save_dir, 'best_ha_gct_model.pth')
-            torch.save({
+            save_dict = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'best_acc': best_acc,
                 'patience_counter': patience_counter,
-            }, best_path)
+            }
+            if model_ema is not None:
+                save_dict['model_ema_state_dict'] = model_ema.ema_model.state_dict()
+            torch.save(save_dict, best_path)
             print(f"New best model saved with Val Acc (Top-1): {best_acc*100:.2f}%")
             if use_wandb:
                 wandb.save(best_path)
@@ -998,21 +1033,28 @@ def main():
         # Periodic save (save full training state for resume capability)
         if (epoch + 1) % 10 == 0:
             periodic_path = os.path.join(run_save_dir, f'ha_gct_epoch_{epoch+1}.pth')
-            torch.save({
+            save_dict_periodic = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'best_acc': best_acc,
                 'patience_counter': patience_counter,
-            }, periodic_path)
+            }
+            if model_ema is not None:
+                save_dict_periodic['model_ema_state_dict'] = model_ema.ema_model.state_dict()
+            torch.save(save_dict_periodic, periodic_path)
             print(f"Periodic checkpoint saved: {periodic_path}")
             if use_wandb:
                 wandb.save(periodic_path)
             
     print("\nTraining completed. Evaluating on test set...")
     best_checkpoint = torch.load(os.path.join(run_save_dir, 'best_ha_gct_model.pth'), map_location=device)
-    model.load_state_dict(best_checkpoint['model_state_dict'])
+    if model_ema is not None and 'model_ema_state_dict' in best_checkpoint:
+        model.load_state_dict(best_checkpoint['model_ema_state_dict'])
+        print("Loaded best EMA weights for final evaluation.")
+    else:
+        model.load_state_dict(best_checkpoint['model_state_dict'])
     
     test_loss, test_acc_top1, test_acc_top5 = eval_model(model, test_loader, criterion, device, desc="[Test]", use_tta=args.tta)
     print(f"Final Test Result - Loss: {test_loss:.4f}, Acc (Top-1/Top-5): {test_acc_top1*100:.2f}%/{test_acc_top5*100:.2f}%")

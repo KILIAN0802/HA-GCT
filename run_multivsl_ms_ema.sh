@@ -3,12 +3,13 @@ set -euo pipefail
 
 GPU_ID=${CUDA_VISIBLE_DEVICES:-"not set"}
 echo "========================================================"
-echo "EMERGENCY OPTIMIZED MultiVSL200 Training & Ensemble"
-echo "Active GPU: $GPU_ID"
-echo "Pipeline start time: $(date)"
+| STARTING TRUE MULTI-STREAM + MODEL EMA PIPELINE
+| Active GPU: $GPU_ID
+| Pipeline start time: $(date)
 echo "========================================================"
 
-ENSEMBLE_RUN_ID="ensemble_opt_$(date +'%Y%m%d_%H%M%S')"
+# Tạo Run ID duy nhất cho đợt train này
+ENSEMBLE_RUN_ID="ensemble_ms_ema_$(date +'%Y%m%d_%H%M%S')"
 echo "Ensemble Run ID: $ENSEMBLE_RUN_ID"
 
 mkdir -p "logs/$ENSEMBLE_RUN_ID"
@@ -22,50 +23,19 @@ DATA_DIR="/mnt/nvme2/users/utbt_sv1/data/MultiVSL200/raw_npy"
 
 for SEED in "${SEEDS[@]}"; do
     echo "--------------------------------------------------------"
-    echo "[STAGE 1/3] Self-Supervised Pre-Training with Seed: $SEED"
+    echo "[STAGE 1/2] Fine-Tuning True Multi-Stream + EMA with Seed: $SEED"
     echo "Start Time: $(date)"
     echo "--------------------------------------------------------"
 
-    # Stage 1: Pretrain - giữ nguyên config gốc, đây không phải bottleneck
+    # Fine-tune classification sử dụng:
+    #   - model-type: multistream (True Multi-Stream: Joint + Bone + Velocity)
+    #   - use-ema: Bật Weight EMA để chống overfitting
+    #   - loss-fn: focal loss
+    #   - pretrain-path: Tận dụng lại tệp pretrained có sẵn từ đợt chạy trước
     $PYTHON_EXEC train.py \
         --dataset multivsl200 \
         --data-dir "$DATA_DIR" \
-        --pretrain \
-        --pretrain-epochs 100 \
-        --pretrain-path "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/pretrained_ha_gct.pth" \
-        --seed "$SEED" \
-        --d-model 256 \
-        --batch-size 32 \
-        --accum-steps 4 \
-        --lr 3e-4 \
-        --save-dir "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/" \
-        --use-wandb \
-        > "logs/${ENSEMBLE_RUN_ID}/pretrain_seed_${SEED}.log" 2>&1
-
-    echo "--------------------------------------------------------"
-    echo "[STAGE 2/3] Fine-Tuning classification with Seed: $SEED"
-    echo "Start Time: $(date)"
-    echo "--------------------------------------------------------"
-
-    # Stage 2: Fine-tune với config cải thiện mạnh để giảm overfitting
-    # Thay đổi so với bản gốc:
-    #   - model-type: earlyfusion -> multistream (tổng quát hóa tốt hơn)
-    #   - lr: 7e-4 -> 2e-4 (ổn định hơn, tránh spike như epoch 261)
-    #   - classifier-lr-mult: 5.0 (encoder học chậm, classifier học nhanh)
-    #   - batch-size: 16 -> 32 (gradient ổn định hơn)
-    #   - accum-steps: 8 -> 4 (effective batch = 128, vừa đủ)
-    #   - mixup-alpha: 0.2 -> 0.4 (augmentation mạnh hơn)
-    #   - drop-path-max: 0.15 -> 0.3 (regularization mạnh hơn)
-    #   - dropout: 0.3 -> 0.4 (giảm overfitting)
-    #   - label-smoothing: 0.1 -> 0.15
-    #   - crop-min-ratio: thêm 0.5 (augmentation thời gian mạnh hơn)
-    #   - class-balanced: thêm (199 class rất dễ imbalance)
-    #   - loss-fn: focal (tốt hơn CE với nhiều class)
-    #   - patience: 50 -> 40 (tránh train quá lâu vô ích)
-    $PYTHON_EXEC train.py \
-        --dataset multivsl200 \
-        --data-dir "$DATA_DIR" \
-        --pretrain-path "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/pretrained_ha_gct.pth" \
+        --pretrain-path "checkpoints/ensemble_opt_20260621_070453/seed_${SEED}/pretrained_ha_gct.pth" \
         --seed "$SEED" \
         --model-type multistream \
         --d-model 256 \
@@ -85,6 +55,8 @@ for SEED in "${SEEDS[@]}"; do
         --class-balanced \
         --loss-fn focal \
         --save-dir "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/" \
+        --use-ema \
+        --ema-decay 0.999 \
         --use-wandb \
         > "logs/${ENSEMBLE_RUN_ID}/seed_${SEED}.log" 2>&1
 
@@ -104,7 +76,7 @@ export MODEL2_PATH="${MODEL_PATHS[1]}"
 export MODEL3_PATH="${MODEL_PATHS[2]}"
 
 echo "========================================================"
-echo "[STAGE 3/3] Running Ensemble Evaluation with TTA"
+echo "[STAGE 2/2] Running Ensemble Evaluation with TTA"
 echo "Start Time: $(date)"
 echo "Model 1: $MODEL1_PATH"
 echo "Model 2: $MODEL2_PATH"
@@ -147,14 +119,15 @@ def load_model(path):
         num_mhsa_layers=2,
         nhead=4,
         num_classes=199,
-        dropout=0.1,       # dropout=0 khi eval (model.eval() tự tắt)
+        dropout=0.1,
         graph_lambda=0.05,
         max_frames=150,
-        drop_path_max=0.0  # tắt drop path khi eval
+        drop_path_max=0.0
     ).to(device)
 
     checkpoint = torch.load(path, map_location=device)
-    state = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
+    # Vì dùng EMA, ưu tiên load model_ema_state_dict nếu có, nếu không thì dùng model_state_dict
+    state = checkpoint.get("model_ema_state_dict", checkpoint.get("model_state_dict", checkpoint))
     model.load_state_dict(state)
     model.eval()
     return model
@@ -176,31 +149,23 @@ def tta_predict(model, x, mask):
         return resampled.reshape(B, C, V, T).permute(0, 1, 3, 2)
 
     with torch.cuda.amp.autocast():
-        # 1. Original
         p1 = F.softmax(model(x, mask=mask), dim=-1)
 
-        # 2. Flip x-axis (mirror signing)
         x_flip = x.clone()
         x_flip[:, 0, :, :] = -x_flip[:, 0, :, :]
         p2 = F.softmax(model(x_flip, mask=mask), dim=-1)
 
-        # 3. Speed x0.9
         p3 = F.softmax(model(resample(x, 0.9), mask=mask), dim=-1)
-
-        # 4. Speed x1.1
         p4 = F.softmax(model(resample(x, 1.1), mask=mask), dim=-1)
-
-        # 5. Speed x0.8 (thêm augmentation mạnh hơn)
         p5 = F.softmax(model(resample(x, 0.8), mask=mask), dim=-1)
 
-    # Weighted average: original và flip quan trọng hơn
     return (2*p1 + 2*p2 + p3 + p4 + p5) / 8.0
 
 transform = SkeletonTransforms(num_joints=27, max_frames=150, verbose=False)
 
 _, _, test_loader = get_multivsl_loaders(
     "/mnt/nvme2/users/utbt_sv1/data/MultiVSL200/raw_npy",
-    batch_size=16,   # nhỏ hơn vì TTA x5 tốn memory
+    batch_size=16,
     num_workers=4,
     transform=transform,
     split_method="random"
@@ -217,7 +182,6 @@ with torch.no_grad():
         batch_mask  = batch_mask.to(device)
         batch_labels = batch_labels.to(device)
 
-        # Trung bình xác suất của tất cả model + TTA
         probs = torch.stack([tta_predict(m, batch_data, batch_mask) for m in models]).mean(dim=0)
 
         num_classes = probs.size(1)

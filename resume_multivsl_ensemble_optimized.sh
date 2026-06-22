@@ -3,102 +3,86 @@ set -euo pipefail
 
 GPU_ID=${CUDA_VISIBLE_DEVICES:-"not set"}
 echo "========================================================"
-echo "EMERGENCY OPTIMIZED MultiVSL200 Training & Ensemble"
+echo "RESUMING OPTIMIZED MultiVSL200 Training & Ensemble Pipeline"
 echo "Active GPU: $GPU_ID"
-echo "Pipeline start time: $(date)"
+echo "Pipeline resume time: $(date)"
 echo "========================================================"
 
-ENSEMBLE_RUN_ID="ensemble_opt_$(date +'%Y%m%d_%H%M%S')"
+# Sử dụng lại Run ID cũ
+ENSEMBLE_RUN_ID="ensemble_opt_20260621_070453"
 echo "Ensemble Run ID: $ENSEMBLE_RUN_ID"
-
-mkdir -p "logs/$ENSEMBLE_RUN_ID"
-mkdir -p "checkpoints/$ENSEMBLE_RUN_ID"
-
-SEEDS=(42 43 44)
-MODEL_PATHS=()
 
 PYTHON_EXEC="/mnt/nvme0/home/utbt_sv1/miniconda3/envs/haslr_env/bin/python"
 DATA_DIR="/mnt/nvme2/users/utbt_sv1/data/MultiVSL200/raw_npy"
 
-for SEED in "${SEEDS[@]}"; do
-    echo "--------------------------------------------------------"
-    echo "[STAGE 1/3] Self-Supervised Pre-Training with Seed: $SEED"
-    echo "Start Time: $(date)"
-    echo "--------------------------------------------------------"
+MODEL_PATHS=()
 
-    # Stage 1: Pretrain - giữ nguyên config gốc, đây không phải bottleneck
-    $PYTHON_EXEC train.py \
-        --dataset multivsl200 \
-        --data-dir "$DATA_DIR" \
-        --pretrain \
-        --pretrain-epochs 100 \
-        --pretrain-path "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/pretrained_ha_gct.pth" \
-        --seed "$SEED" \
-        --d-model 256 \
-        --batch-size 32 \
-        --accum-steps 4 \
-        --lr 3e-4 \
-        --save-dir "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/" \
-        --use-wandb \
-        > "logs/${ENSEMBLE_RUN_ID}/pretrain_seed_${SEED}.log" 2>&1
+# 1. Thêm checkpoint đã hoàn thành của Seed 42
+BEST_42="checkpoints/ensemble_opt_20260621_070453/seed_42/20260621_095252/best_ha_gct_model.pth"
+if [ ! -f "$BEST_42" ]; then
+    echo "ERROR: Seed 42 best model not found at $BEST_42!"
+    exit 1
+fi
+echo "Loaded completed Seed 42 checkpoint: $BEST_42"
+MODEL_PATHS+=("$BEST_42")
 
-    echo "--------------------------------------------------------"
-    echo "[STAGE 2/3] Fine-Tuning classification with Seed: $SEED"
-    echo "Start Time: $(date)"
-    echo "--------------------------------------------------------"
+# 2. Thêm checkpoint đã hoàn thành của Seed 43
+BEST_43="checkpoints/ensemble_opt_20260621_070453/seed_43/20260622_111107/best_ha_gct_model.pth"
+if [ ! -f "$BEST_43" ]; then
+    echo "ERROR: Seed 43 best model not found at $BEST_43!"
+    exit 1
+fi
+echo "Loaded completed Seed 43 checkpoint: $BEST_43"
+MODEL_PATHS+=("$BEST_43")
 
-    # Stage 2: Fine-tune với config cải thiện mạnh để giảm overfitting
-    # Thay đổi so với bản gốc:
-    #   - model-type: earlyfusion -> multistream (tổng quát hóa tốt hơn)
-    #   - lr: 7e-4 -> 2e-4 (ổn định hơn, tránh spike như epoch 261)
-    #   - classifier-lr-mult: 5.0 (encoder học chậm, classifier học nhanh)
-    #   - batch-size: 16 -> 32 (gradient ổn định hơn)
-    #   - accum-steps: 8 -> 4 (effective batch = 128, vừa đủ)
-    #   - mixup-alpha: 0.2 -> 0.4 (augmentation mạnh hơn)
-    #   - drop-path-max: 0.15 -> 0.3 (regularization mạnh hơn)
-    #   - dropout: 0.3 -> 0.4 (giảm overfitting)
-    #   - label-smoothing: 0.1 -> 0.15
-    #   - crop-min-ratio: thêm 0.5 (augmentation thời gian mạnh hơn)
-    #   - class-balanced: thêm (199 class rất dễ imbalance)
-    #   - loss-fn: focal (tốt hơn CE với nhiều class)
-    #   - patience: 50 -> 40 (tránh train quá lâu vô ích)
-    $PYTHON_EXEC train.py \
-        --dataset multivsl200 \
-        --data-dir "$DATA_DIR" \
-        --pretrain-path "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/pretrained_ha_gct.pth" \
-        --seed "$SEED" \
-        --model-type multistream \
-        --d-model 256 \
-        --num-classes 199 \
-        --epochs 1000 \
-        --patience 40 \
-        --batch-size 32 \
-        --accum-steps 4 \
-        --lr 2e-4 \
-        --classifier-lr-mult 5.0 \
-        --mixup-alpha 0.4 \
-        --warmup-epochs 10 \
-        --drop-path-max 0.3 \
-        --dropout 0.4 \
-        --label-smoothing 0.15 \
-        --crop-min-ratio 0.5 \
-        --class-balanced \
-        --loss-fn focal \
-        --save-dir "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/" \
-        --use-wandb \
-        > "logs/${ENSEMBLE_RUN_ID}/seed_${SEED}.log" 2>&1
+# 3. Resume training Seed 44 từ checkpoint epoch 200
+SEED=44
+echo "--------------------------------------------------------"
+echo "[STAGE 2/3 - RESUME] Fine-Tuning classification with Seed: $SEED"
+echo "Resuming from epoch 200..."
+echo "Start Time: $(date)"
+echo "Logs will be appended to: logs/${ENSEMBLE_RUN_ID}/seed_${SEED}.log"
+echo "--------------------------------------------------------"
 
-    echo "Finished training for Seed $SEED at $(date)"
+$PYTHON_EXEC train.py \
+    --dataset multivsl200 \
+    --data-dir "$DATA_DIR" \
+    --pretrain-path "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/pretrained_ha_gct.pth" \
+    --seed "$SEED" \
+    --model-type earlyfusion \
+    --d-model 256 \
+    --num-classes 199 \
+    --epochs 1000 \
+    --patience 40 \
+    --batch-size 32 \
+    --accum-steps 4 \
+    --lr 2e-4 \
+    --classifier-lr-mult 5.0 \
+    --mixup-alpha 0.4 \
+    --warmup-epochs 10 \
+    --drop-path-max 0.3 \
+    --dropout 0.4 \
+    --label-smoothing 0.15 \
+    --crop-min-ratio 0.5 \
+    --class-balanced \
+    --loss-fn focal \
+    --save-dir "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/" \
+    --resume "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/20260622_163946/ha_gct_epoch_200.pth" \
+    --use-wandb \
+    >> "logs/${ENSEMBLE_RUN_ID}/seed_${SEED}.log" 2>&1
 
-    BEST_PATH=$(find "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/" -name "best_ha_gct_model.pth" | sort | tail -n 1)
-    if [ -z "$BEST_PATH" ] || [ ! -f "$BEST_PATH" ]; then
-        echo "ERROR: Best checkpoint not found for Seed $SEED!"
-        exit 1
-    fi
-    echo "Captured Best Checkpoint: $BEST_PATH"
-    MODEL_PATHS+=("$BEST_PATH")
-done
+echo "Finished training for Seed $SEED at $(date)"
 
+# Tìm checkpoint tốt nhất của Seed 44 sau khi train xong
+BEST_44=$(find "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/" -name "best_ha_gct_model.pth" | sort | tail -n 1)
+if [ -z "$BEST_44" ] || [ ! -f "$BEST_44" ]; then
+    echo "ERROR: Best checkpoint not found for Seed $SEED!"
+    exit 1
+fi
+echo "Captured Best Checkpoint for Seed 44: $BEST_44"
+MODEL_PATHS+=("$BEST_44")
+
+# 4. Chạy Stage 3: Ensemble Evaluation với TTA
 export MODEL1_PATH="${MODEL_PATHS[0]}"
 export MODEL2_PATH="${MODEL_PATHS[1]}"
 export MODEL3_PATH="${MODEL_PATHS[2]}"
@@ -121,7 +105,7 @@ sys.path.extend(["./", "../"])
 
 from utils.preprocessing import SkeletonTransforms
 from data.dataloader import get_multivsl_loaders
-from models.ha_gct import MultiStreamHA_GCT
+from models.ha_gct import EarlyFusionHA_GCT
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Ensemble Evaluation Device: {device}")
@@ -139,7 +123,7 @@ if not model_paths:
 print(f"Loading {len(model_paths)} models...")
 
 def load_model(path):
-    model = MultiStreamHA_GCT(
+    model = EarlyFusionHA_GCT(
         num_joints=27,
         in_channels=2,
         d_model=256,
