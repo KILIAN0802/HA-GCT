@@ -3,19 +3,19 @@ set -euo pipefail
 
 GPU_ID=${CUDA_VISIBLE_DEVICES:-"not set"}
 echo "========================================================"
-echo "| STARTING TRUE MULTI-STREAM + MODEL EMA PIPELINE"
+echo "| STARTING OPTIMIZED MULTI-STREAM + MODEL EMA PIPELINE"
 echo "| Active GPU: $GPU_ID"
 echo "| Pipeline start time: $(date)"
 echo "========================================================"
 
 # Tạo Run ID duy nhất cho đợt train này
-ENSEMBLE_RUN_ID="ensemble_ms_ema_$(date +'%Y%m%d_%H%M%S')"
+ENSEMBLE_RUN_ID="ensemble_ms_ema_opt_$(date +'%Y%m%d_%H%M%S')"
 echo "Ensemble Run ID: $ENSEMBLE_RUN_ID"
 
 mkdir -p "logs/$ENSEMBLE_RUN_ID"
 mkdir -p "checkpoints/$ENSEMBLE_RUN_ID"
 
-SEEDS=(42 43 44)
+SEEDS=(44)
 MODEL_PATHS=()
 
 PYTHON_EXEC="/mnt/nvme0/home/utbt_sv1/miniconda3/envs/haslr_env/bin/python"
@@ -23,15 +23,19 @@ DATA_DIR="/mnt/nvme2/users/utbt_sv1/data/MultiVSL200/raw_npy"
 
 for SEED in "${SEEDS[@]}"; do
     echo "--------------------------------------------------------"
-    echo "[STAGE 1/2] Fine-Tuning True Multi-Stream + EMA with Seed: $SEED"
+    echo "[STAGE 1/2] Fine-Tuning Optimized Multi-Stream + EMA with Seed: $SEED"
     echo "Start Time: $(date)"
     echo "--------------------------------------------------------"
 
-    # Fine-tune classification sử dụng:
-    #   - model-type: multistream (True Multi-Stream: Joint + Bone + Velocity)
-    #   - use-ema: Bật Weight EMA để chống overfitting
-    #   - loss-fn: focal loss
-    #   - pretrain-path: Tận dụng lại tệp pretrained có sẵn từ đợt chạy trước
+    # Fine-tune classification sử dụng cấu hình tối ưu lực cản (regularization) và tăng tốc độ học:
+    #   - lr: tăng lên 5e-4 (bù đắp cho dung lượng mô hình x3 lần)
+    #   - classifier-lr-mult: 2.0 (classifier lr = 1e-3)
+    #   - mixup-alpha: giảm xuống 0.2 (giảm độ nhiễu)
+    #   - drop-path-max: giảm xuống 0.15 (tăng dung lượng học)
+    #   - dropout: giảm xuống 0.3 (tránh cản trở học tập ban đầu)
+    #   - label-smoothing: giảm xuống 0.10
+    #   - patience: tăng lên 60 epochs (cho mô hình lớn thêm thời gian hội tụ)
+    #   - ema-decay: giảm xuống 0.99 (phù hợp với số step nhỏ 131/epoch để EMA bắt kịp mô hình thực tế)
     $PYTHON_EXEC train.py \
         --dataset multivsl200 \
         --data-dir "$DATA_DIR" \
@@ -41,22 +45,22 @@ for SEED in "${SEEDS[@]}"; do
         --d-model 256 \
         --num-classes 199 \
         --epochs 1000 \
-        --patience 40 \
+        --patience 60 \
         --batch-size 32 \
         --accum-steps 4 \
-        --lr 2e-4 \
-        --classifier-lr-mult 5.0 \
-        --mixup-alpha 0.4 \
+        --lr 5e-4 \
+        --classifier-lr-mult 2.0 \
+        --mixup-alpha 0.2 \
         --warmup-epochs 10 \
-        --drop-path-max 0.3 \
-        --dropout 0.4 \
-        --label-smoothing 0.15 \
+        --drop-path-max 0.15 \
+        --dropout 0.3 \
+        --label-smoothing 0.1 \
         --crop-min-ratio 0.5 \
         --class-balanced \
         --loss-fn focal \
         --save-dir "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/" \
         --use-ema \
-        --ema-decay 0.999 \
+        --ema-decay 0.99 \
         --use-wandb \
         > "logs/${ENSEMBLE_RUN_ID}/seed_${SEED}.log" 2>&1
 
@@ -126,7 +130,6 @@ def load_model(path):
     ).to(device)
 
     checkpoint = torch.load(path, map_location=device)
-    # Vì dùng EMA, ưu tiên load model_ema_state_dict nếu có, nếu không thì dùng model_state_dict
     state = checkpoint.get("model_ema_state_dict", checkpoint.get("model_state_dict", checkpoint))
     model.load_state_dict(state)
     model.eval()
