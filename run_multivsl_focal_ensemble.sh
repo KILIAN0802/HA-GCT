@@ -1,31 +1,31 @@
 #!/bin/bash
 set -euo pipefail
 
-# In thông tin GPU hoạt động
+# Print GPU information
 GPU_ID=${CUDA_VISIBLE_DEVICES:-"not set"}
 echo "========================================================"
-echo "Starting OPTIMIZED MultiVSL200 Training & Ensemble Pipeline"
+# Tieude phien ban Focal Loss
+echo "Starting Focal Loss MultiVSL200 Training & Ensemble Pipeline"
 echo "Active GPU: $GPU_ID"
 echo "Pipeline start time: $(date)"
 echo "========================================================"
 
-# 1. Tự động tạo ID mới cho lượt chạy dựa trên timestamp hiện tại
-ENSEMBLE_RUN_ID="ensemble_opt_$(date +'%Y%m%d_%H%M%S')"
+# 1. Tu dong tao ID moi cho luot chay
+ENSEMBLE_RUN_ID="ensemble_focal_$(date +'%Y%m%d_%H%M%S')"
 echo "Ensemble Run ID: $ENSEMBLE_RUN_ID"
 
-# Đảm bảo các thư mục đã tồn tại
+# Dam bao cac thu muc da ton tai
 mkdir -p "logs/$ENSEMBLE_RUN_ID"
 mkdir -p "checkpoints/$ENSEMBLE_RUN_ID"
 
-# 2. Danh sách các Seed cần xử lý tuần tự
+# 2. Danh sach cac Seed can xu ly
 SEEDS=(48 54 65)
 MODEL_PATHS=()
 
-# Đường dẫn Python trỏ trực tiếp đến môi trường conda haslr_env của bạn
+# Duong dan Python den moi truong conda haslr_env
 PYTHON_EXEC="/mnt/nvme0/home/utbt_sv1/miniconda3/envs/haslr_env/bin/python"
 
 for SEED in "${SEEDS[@]}"; do
-    # Chạy toàn bộ 2 Stage bình thường từ đầu cho tất cả các seed (không resume)
     echo "--------------------------------------------------------"
     echo "[STAGE 1/3] Self-Supervised Pre-Training with Seed: $SEED"
     echo "Start Time: $(date)"
@@ -48,11 +48,12 @@ for SEED in "${SEEDS[@]}"; do
         > "logs/${ENSEMBLE_RUN_ID}/pretrain_seed_${SEED}.log" 2>&1
 
     echo "--------------------------------------------------------"
-    echo "[STAGE 2/3] Fine-Tuning classification with Seed: $SEED"
+    echo "[STAGE 2/3] Fine-Tuning classification (Focal Loss) with Seed: $SEED"
     echo "Start Time: $(date)"
     echo "Logs will be written to: logs/${ENSEMBLE_RUN_ID}/seed_${SEED}.log"
     echo "--------------------------------------------------------"
 
+    # Chay Fine-Tuning voi cac sieu tham so custom cua ban (focal loss, mixup 0.4, dropout 0.4, etc.)
     $PYTHON_EXEC train.py \
         --dataset multivsl200 \
         --data-dir "/mnt/nvme2/users/utbt_sv1/data/MultiVSL200/raw_npy" \
@@ -60,23 +61,28 @@ for SEED in "${SEEDS[@]}"; do
         --seed "$SEED" \
         --model-type earlyfusion \
         --d-model 256 \
+        --num-classes 199 \
         --epochs 1000 \
-        --patience 50 \
-        --batch-size 16 \
-        --accum-steps 8 \
-        --lr 7e-4 \
-        --mixup-alpha 0.2 \
-        --warmup-epochs 5 \
-        --drop-path-max 0.15 \
-        --dropout 0.3 \
-        --label-smoothing 0.1 \
+        --patience 40 \
+        --batch-size 32 \
+        --accum-steps 4 \
+        --lr 2e-4 \
+        --classifier-lr-mult 5.0 \
+        --mixup-alpha 0.4 \
+        --warmup-epochs 10 \
+        --drop-path-max 0.3 \
+        --dropout 0.4 \
+        --label-smoothing 0.15 \
+        --crop-min-ratio 0.5 \
+        --class-balanced \
+        --loss-fn focal \
         --save-dir "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/" \
         --use-wandb \
         > "logs/${ENSEMBLE_RUN_ID}/seed_${SEED}.log" 2>&1
         
     echo "Finished training for Seed $SEED at $(date)"
 
-    # Tự động bắt đường dẫn của checkpoint tốt nhất vừa train xong
+    # Tu dong bat duong dan best checkpoint
     BEST_PATH=$(find "checkpoints/${ENSEMBLE_RUN_ID}/seed_${SEED}/" -name "best_ha_gct_model.pth" | sort | tail -n 1)
     if [ -z "$BEST_PATH" ] || [ ! -f "$BEST_PATH" ]; then
         echo "ERROR: Best checkpoint not found for Seed $SEED!"
@@ -86,14 +92,14 @@ for SEED in "${SEEDS[@]}"; do
     MODEL_PATHS+=("$BEST_PATH")
 done
 
-# Lưu các đường dẫn checkpoint vào biến môi trường để truyền vào mã Python đánh giá
+# Luu cac duong dan checkpoint vao bien moi truong cho phan evaluation
 export MODEL1_PATH="${MODEL_PATHS[0]}"
 export MODEL2_PATH="${MODEL_PATHS[1]}"
 export MODEL3_PATH="${MODEL_PATHS[2]}"
 
-# 3. Đánh giá Ensemble kết quả đồng thuận
+# 3. Ensemble Evaluation
 echo "========================================================"
-echo "[STAGE 2/2] Running Ensemble Evaluation"
+echo "[STAGE 3/3] Running Ensemble Evaluation"
 echo "Start Time: $(date)"
 echo "Model 1 Path: $MODEL1_PATH"
 echo "Model 2 Path: $MODEL2_PATH"
@@ -149,7 +155,7 @@ for idx, path in enumerate(model_paths):
     models.append(model)
     print(f"Loaded Model {idx+1} from {path}")
 
-# Tải tập dữ liệu test
+# Load test dataset
 transform = SkeletonTransforms(
     num_joints=27,
     max_frames=150,
@@ -174,7 +180,6 @@ with torch.no_grad():
         batch_mask = batch_mask.to(device)
         batch_labels = batch_labels.to(device)
         
-        # Lấy xác suất trung bình của cả 3 mô hình
         outputs_list = [m(batch_data, mask=batch_mask) for m in models]
         logits = torch.stack(outputs_list, dim=0).mean(dim=0)
         
