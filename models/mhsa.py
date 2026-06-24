@@ -220,7 +220,14 @@ class MHSAEncoderLayer(nn.Module):
 
 class GraphAugmentedAttention(nn.Module):
     """
-    Multi-Head Self-Attention (simplified standard version)
+    Graph-Augmented Multi-Head Self-Attention
+    
+    Implements: Attention = Softmax(QK^T / √d_k + λ · A_graph) · V
+    
+    The graph adjacency bias is ONLY applied when the sequence length T equals
+    num_joints (spatial attention mode). For temporal attention (T ≠ num_joints),
+    standard scaled dot-product attention is used since temporal frames have no
+    inherent graph topology.
     """
     
     def __init__(
@@ -236,7 +243,6 @@ class GraphAugmentedAttention(nn.Module):
         self.d_model = d_model
         self.nhead = nhead
         self.num_joints = num_joints
-        self.graph_lambda = graph_lambda
         self.d_k = d_model // nhead
         
         # ========== SHARED PROJECTIONS ==========
@@ -249,11 +255,76 @@ class GraphAugmentedAttention(nn.Module):
         self.proj_dropout = nn.Dropout(dropout)
         self.scale = math.sqrt(self.d_k)
         
+        # ========== GRAPH-AUGMENTED ATTENTION BIAS ==========
+        # Learnable scalar λ that controls the strength of graph bias
+        self.graph_lambda = nn.Parameter(torch.tensor(float(graph_lambda)))
+        
+        # Learnable adjacency bias: one per attention head (nhead, V, V)
+        # Initialized from the physical skeleton topology of sign_27
+        graph_bias_init = self._build_skeleton_adjacency(num_joints)
+        # Expand to per-head: (nhead, V, V)
+        self.graph_bias = nn.Parameter(
+            graph_bias_init.unsqueeze(0).repeat(nhead, 1, 1)
+        )
+        
         self._init_weights()
+    
+    def _build_skeleton_adjacency(self, num_joints):
+        """
+        Build a normalized adjacency matrix from the physical skeleton topology
+        of the 27-joint sign language body model.
+        
+        Topology (0-indexed, matching sign_27.py after bias=-5):
+            Nose(0) -> ShoulderL(1), ShoulderR(2)
+            ShoulderL(1) -> ElbowL(3), ShoulderR(2) -> ElbowR(4)
+            ElbowL(3) -> WristL(5), ElbowR(4) -> WristR(6)
+            WristL(5) -> PalmL(7), WristR(6) -> PalmR(17)
+            PalmL(7) -> ThumbL(8), IndexL(9), MiddleL(11), RingL(13), PinkyL(15)
+            IndexL(9)->IndexLTip(10), MiddleL(11)->MiddleLTip(12), etc.
+            PalmR(17) -> ThumbR(18), IndexR(19), MiddleR(21), RingR(23), PinkyR(25)
+            IndexR(19)->IndexRTip(20), MiddleR(21)->MiddleRTip(22), etc.
+        
+        Returns:
+            A: (V, V) symmetric normalized adjacency with self-loops
+        """
+        A = torch.zeros(num_joints, num_joints)
+        
+        # Define edges (undirected) from skeleton topology
+        edges = [
+            (0, 1), (0, 2),         # Nose -> Shoulders
+            (1, 3), (2, 4),         # Shoulders -> Elbows
+            (3, 5), (4, 6),         # Elbows -> Wrists
+            (5, 7), (6, 17),        # Wrists -> Palms
+            # Left hand
+            (7, 8), (7, 9), (7, 11), (7, 13), (7, 15),  # Palm L -> fingers
+            (9, 10), (11, 12), (13, 14), (15, 16),       # Finger roots -> tips
+            # Right hand
+            (17, 18), (17, 19), (17, 21), (17, 23), (17, 25),  # Palm R -> fingers
+            (19, 20), (21, 22), (23, 24), (25, 26),             # Finger roots -> tips
+        ]
+        
+        for i, j in edges:
+            if i < num_joints and j < num_joints:
+                A[i, j] = 1.0
+                A[j, i] = 1.0
+        
+        # Add self-loops
+        A = A + torch.eye(num_joints)
+        
+        # Symmetric normalization: D^{-1/2} A D^{-1/2}
+        D = A.sum(dim=-1)
+        D_inv_sqrt = torch.where(D > 0, D.pow(-0.5), torch.zeros_like(D))
+        D_inv_sqrt_mat = torch.diag(D_inv_sqrt)
+        A = D_inv_sqrt_mat @ A @ D_inv_sqrt_mat
+        
+        return A
     
     def forward(self, x, mask=None, graph_adjacency=None):
         """
-        Forward pass for standard Multi-Head Attention
+        Forward pass for Graph-Augmented Multi-Head Attention.
+        
+        Graph bias is applied ONLY when T == num_joints (spatial attention).
+        For temporal attention (T != num_joints), standard attention is used.
         """
         B, T, D = x.shape
         
@@ -267,8 +338,15 @@ class GraphAugmentedAttention(nn.Module):
         K = K.view(B, T, self.nhead, self.d_k).transpose(1, 2)
         V = V.view(B, T, self.nhead, self.d_k).transpose(1, 2)
         
-        # Standard scaled dot-product attention: (B, h, T, T)
+        # Scaled dot-product attention scores: (B, h, T, T)
         attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        
+        # ========== GRAPH BIAS (spatial mode only) ==========
+        # Apply learnable graph adjacency bias when T matches num_joints
+        # Formula: Attention = Softmax(QK^T / √d_k + λ · A_graph) · V
+        if T == self.num_joints:
+            # graph_bias shape: (nhead, V, V) -> (1, nhead, V, V) for broadcasting
+            attn_scores = attn_scores + self.graph_lambda * self.graph_bias.unsqueeze(0)
         
         if mask is not None:
             # mask shape: (B, T) -> (B, 1, 1, T)

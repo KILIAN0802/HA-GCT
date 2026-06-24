@@ -229,7 +229,15 @@ class HA_GCT(nn.Module):
 
 class MultiStreamHA_GCT(nn.Module):
     """
-    Multi-Stream HA-GCT (Late Fusion of Joint, Bone, and Velocity) - Simplified to Single Stream (Joint Only)
+    True Multi-Stream HA-GCT with 4 independent branches:
+      1. Joint: Raw skeleton coordinates
+      2. Bone: Vector differences between connected joints (child - parent)
+      3. Motion: Temporal velocity (frame[t] - frame[t-1])
+      4. Bone-Motion: Temporal velocity of bone vectors
+    
+    Each stream has SEPARATE weights to capture modality-specific features.
+    Fusion uses learnable softmax-normalized weights at the logit level:
+      F_final = Σ(softmax(α_i) × logits_i)
     """
     def __init__(
         self,
@@ -243,12 +251,12 @@ class MultiStreamHA_GCT(nn.Module):
         dropout=0.5,
         graph_lambda=0.05,
         max_frames=100,
-        drop_path_max=0.0
+        drop_path_max=0.2
     ):
         super().__init__()
         
-        # Stream 1: Joint
-        self.stream_joint = HA_GCT(
+        # Common kwargs for all streams
+        stream_kwargs = dict(
             num_joints=num_joints,
             in_channels=in_channels,
             d_model=d_model,
@@ -262,8 +270,107 @@ class MultiStreamHA_GCT(nn.Module):
             drop_path_max=drop_path_max
         )
         
+        # 4 independent streams with separate weights
+        self.stream_joint = HA_GCT(**stream_kwargs)
+        self.stream_bone = HA_GCT(**stream_kwargs)
+        self.stream_motion = HA_GCT(**stream_kwargs)
+        self.stream_bone_motion = HA_GCT(**stream_kwargs)
+        
+        # Learnable fusion weights (initialized to equal 0.25 each)
+        # Applied via softmax to ensure they sum to 1
+        self.fusion_weights = nn.Parameter(torch.zeros(4))  # softmax(0,0,0,0) = (0.25, 0.25, 0.25, 0.25)
+        
+        # Skeleton topology mapping for bone calculation
+        # Maps child_joint_idx -> parent_joint_idx
+        # Based on 27-joint sign language body model (sign_27.py)
+        self._parent_indices = {
+            0: 0,       # Nose / Root (self-loop)
+            1: 0,       # Shoulder L -> Nose
+            2: 0,       # Shoulder R -> Nose
+            3: 1,       # Elbow L -> Shoulder L
+            4: 2,       # Elbow R -> Shoulder R
+            5: 3,       # Wrist L -> Elbow L
+            6: 4,       # Wrist R -> Elbow R
+            7: 5,       # Palm L -> Wrist L
+            17: 6,      # Palm R -> Wrist R
+            8: 7,       # Thumb L -> Palm L
+            9: 7,       # Index L root -> Palm L
+            10: 9,      # Index L tip -> Index L root
+            11: 7,      # Middle L root -> Palm L
+            12: 11,     # Middle L tip -> Middle L root
+            13: 7,      # Ring L root -> Palm L
+            14: 13,     # Ring L tip -> Ring L root
+            15: 7,      # Pinky L root -> Palm L
+            16: 15,     # Pinky L tip -> Pinky L root
+            18: 17,     # Thumb R -> Palm R
+            19: 17,     # Index R root -> Palm R
+            20: 19,     # Index R tip -> Index R root
+            21: 17,     # Middle R root -> Palm R
+            22: 21,     # Middle R tip -> Middle R root
+            23: 17,     # Ring R root -> Palm R
+            24: 23,     # Ring R tip -> Ring R root
+            25: 17,     # Pinky R root -> Palm R
+            26: 25,     # Pinky R tip -> Pinky R root
+        }
+        
+        # Pre-compute parent index tensor for vectorized bone computation
+        parent_idx = torch.zeros(num_joints, dtype=torch.long)
+        for child, parent in self._parent_indices.items():
+            if child < num_joints:
+                parent_idx[child] = parent
+        self.register_buffer('parent_idx', parent_idx)
+        
+    def _compute_bone(self, joint):
+        """
+        Compute bone vectors: B_v = J_child - J_parent
+        
+        Args:
+            joint: (B, C, T, V) raw joint coordinates
+        Returns:
+            bone: (B, C, T, V) bone vectors (direction from parent to child)
+        """
+        # Vectorized: bone[:,:,:,child] = joint[:,:,:,child] - joint[:,:,:,parent]
+        bone = joint - joint[:, :, :, self.parent_idx]
+        return bone
+    
+    def _compute_motion(self, x):
+        """
+        Compute temporal velocity: M_t = X_t - X_{t-1}
+        
+        Args:
+            x: (B, C, T, V) any skeleton signal (joint or bone)
+        Returns:
+            motion: (B, C, T, V) temporal differences (first frame is zero)
+        """
+        motion = torch.zeros_like(x)
+        # motion[:, :, t, :] = x[:, :, t, :] - x[:, :, t-1, :]
+        motion[:, :, 1:, :] = x[:, :, 1:, :] - x[:, :, :-1, :]
+        return motion
+        
     def forward(self, joint, mask=None):
-        output = self.stream_joint(joint, mask=mask)
+        """
+        Args:
+            joint: (B, C, T, V) raw joint coordinates
+            mask: (B, T) boolean mask for valid frames
+        Returns:
+            output: (B, num_classes) fused logits
+        """
+        # Compute derived streams on-the-fly (no DataLoader changes needed)
+        bone = self._compute_bone(joint)
+        motion = self._compute_motion(joint)
+        bone_motion = self._compute_motion(bone)
+        
+        # Forward through each independent stream
+        logits_j = self.stream_joint(joint, mask=mask)
+        logits_b = self.stream_bone(bone, mask=mask)
+        logits_m = self.stream_motion(motion, mask=mask)
+        logits_bm = self.stream_bone_motion(bone_motion, mask=mask)
+        
+        # Learnable weighted sum of logits
+        # softmax ensures weights are positive and sum to 1
+        w = torch.softmax(self.fusion_weights, dim=0)
+        output = w[0] * logits_j + w[1] * logits_b + w[2] * logits_m + w[3] * logits_bm
+        
         return output
 
 class EarlyFusionHA_GCT(nn.Module):
